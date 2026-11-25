@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <WindowsSdkPackageVersion>10.0.19041.31</WindowsSdkPackageVersion>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <AssemblyName>DesktopRadio</AssemblyName>
+    <Product>Desktop Radio</Product>
+    <Description>Internet radio for Windows.</Description>
+    <ApplicationIcon>Assets/Radio.ico</ApplicationIcon>
+    <PlatformTarget>x64</PlatformTarget>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Assets/stations.json" LogicalName="DesktopRadio.Stations.json" />
+    <EmbeddedResource Include="Assets/Radio.ico" LogicalName="DesktopRadio.Radio.ico" />
+  </ItemGroup>
+</Project>
