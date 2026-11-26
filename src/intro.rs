@@ -20,15 +20,13 @@ const WHITE: Color = rgb(0xffffff);
 #[derive(Clone, Copy)]
 pub struct Frame {
     millis: f32,
-    returning: bool,
     dismiss: f32,
 }
 
 impl Frame {
-    pub fn at(millis: f32, returning: bool) -> Self {
+    pub fn at(millis: f32) -> Self {
         Self {
             millis,
-            returning,
             dismiss: 0.,
         }
     }
@@ -42,9 +40,9 @@ pub struct Animation {
 }
 
 impl Animation {
-    pub fn new(now: Instant, returning: bool) -> Self {
+    pub fn new(now: Instant) -> Self {
         Self {
-            frame: Frame::at(0., returning),
+            frame: Frame::at(0.),
             started: now,
             last: now,
             dismissal: None,
@@ -168,7 +166,6 @@ const TIP_SCREEN: (f32, f32) = (CX, TOP + TIP.1 * MAST_SCALE);
 
 pub struct Scene {
     frame: Frame,
-    closed: f32,
     open: f32,
     reveal: f32,
     leave: f32,
@@ -178,16 +175,10 @@ pub struct Scene {
 impl Scene {
     pub fn new(frame: Frame) -> Self {
         let t = frame.millis;
-        let closed = if frame.returning {
-            ease(t, 0., 240.)
-        } else {
-            1.
-        };
         let open = span(t, OPEN_START, END_MS).max(frame.dismiss);
         let leave = span(t, 1320., 1640.).max(frame.dismiss);
         Self {
             frame,
-            closed,
             open,
             reveal: ease(t, 120., 420.),
             leave,
@@ -196,11 +187,7 @@ impl Scene {
     }
 
     pub fn content(&self) -> Option<((f32, f32), f32)> {
-        if self.closed >= 1. && self.open == 0. {
-            return None;
-        }
-        let depth = self.closed.min(1. - DECELERATE.at(self.open));
-        Some((TIP_SCREEN, 1. - 0.08 * depth))
+        (self.open > 0.).then(|| (TIP_SCREEN, 0.92 + 0.08 * DECELERATE.at(self.open)))
     }
 
     pub fn draw(&self, canvas: &mut Canvas, palette: Palette, language: &str) {
@@ -211,7 +198,7 @@ impl Scene {
         }
 
         let accent = palette.accent;
-        let display = self.reveal * self.strength * self.closed * (1. - open);
+        let display = self.reveal * self.strength * (1. - open);
         let edge = HEIGHT.min(WIDTH) as f32;
         glow(
             canvas,
@@ -235,36 +222,25 @@ impl Scene {
     }
 
     fn backdrop(&self, canvas: &Canvas, color: Color, open: f32) {
-        let reach = TIP_SCREEN
-            .0
-            .hypot(TIP_SCREEN.1.max(VIEWPORT.h - TIP_SCREEN.1));
-        if self.closed < 1. {
-            let progress = self.closed * (1. - open);
-            if progress > 0. {
-                glow(
-                    canvas,
-                    Area::around(TIP_SCREEN, (reach * progress / IRIS_CLEAR).max(1.)),
-                    [(0., color), (IRIS_CLEAR, color), (1., alpha(color, 0.))],
-                );
-            }
+        if open == 0. {
+            canvas.clear(color);
         } else if open < 1. {
-            if open == 0. {
-                canvas.clear(color);
-            } else {
-                let opening = Area::around(TIP_SCREEN, (reach * open / IRIS_CLEAR).max(1.));
-                // Overlap the two antialiased edges so the feather has no visible seam.
-                let mask = opening.inset(1.0, 1.0);
-                canvas.outside_ellipse(VIEWPORT, if mask.w > 0. { mask } else { opening }, color);
-                glow(
-                    canvas,
-                    opening,
-                    [
-                        (0., alpha(color, 0.)),
-                        (IRIS_CLEAR, alpha(color, 0.)),
-                        (1., color),
-                    ],
-                );
-            }
+            let reach = TIP_SCREEN
+                .0
+                .hypot(TIP_SCREEN.1.max(VIEWPORT.h - TIP_SCREEN.1));
+            let opening = Area::around(TIP_SCREEN, (reach * open / IRIS_CLEAR).max(1.));
+            // Overlap the two antialiased edges so the feather has no visible seam.
+            let mask = opening.inset(1.0, 1.0);
+            canvas.outside_ellipse(VIEWPORT, if mask.w > 0. { mask } else { opening }, color);
+            glow(
+                canvas,
+                opening,
+                [
+                    (0., alpha(color, 0.)),
+                    (IRIS_CLEAR, alpha(color, 0.)),
+                    (1., color),
+                ],
+            );
         }
     }
 
@@ -643,18 +619,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cold_start_hides_player_until_iris_and_return_veils_it_first() {
-        assert!(Scene::new(Frame::at(0., false)).content().is_none());
-        assert_eq!(
-            Scene::new(Frame::at(0., true)).content(),
-            Some((TIP_SCREEN, 1.))
-        );
-        assert!(Scene::new(Frame::at(240., true)).content().is_none());
-        assert!(Scene::new(Frame::at(1380., true)).content().is_none());
-        let (_, scale) = Scene::new(Frame::at(1450., false)).content().unwrap();
+    fn every_open_hides_player_until_iris() {
+        for millis in [0., 15., 120., 240., 800., 1320., 1380.] {
+            assert!(Scene::new(Frame::at(millis)).content().is_none());
+        }
+        let (_, scale) = Scene::new(Frame::at(1450.)).content().unwrap();
         assert!((0.92..1.).contains(&scale));
         assert_eq!(
-            Scene::new(Frame::at(END_MS, false)).content(),
+            Scene::new(Frame::at(END_MS)).content(),
             Some((TIP_SCREEN, 1.))
         );
     }
@@ -662,7 +634,7 @@ mod tests {
     #[test]
     fn late_frame_stays_bounded_and_tap_uses_original_exit_duration() {
         let start = Instant::now();
-        let mut animation = Animation::new(start, false);
+        let mut animation = Animation::new(start);
         assert!(!animation.advance(start + Duration::from_millis(250)));
         assert_eq!(animation.frame().millis, 2. * FRAME_MS as f32);
         let tapped = start + Duration::from_millis(300);

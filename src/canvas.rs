@@ -132,10 +132,8 @@ impl Surface {
         }
     }
 
-    pub fn blit(&self, dc: HDC) {
-        unsafe {
-            BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY);
-        }
+    pub fn blit(&self, dc: HDC) -> bool {
+        unsafe { BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY) != 0 }
     }
 
     pub fn png(&self, path: &Path) -> Result<()> {
@@ -284,6 +282,27 @@ impl Canvas {
     pub fn clear(&self, color: Color) {
         unsafe {
             GdipGraphicsClear(self.graphics, color);
+        }
+    }
+
+    pub fn clipped(&mut self, area: Area, draw: impl FnOnce(&mut Self)) {
+        let mut saved = 0;
+        unsafe {
+            if GdipSaveGraphics(self.graphics, &mut saved) != 0 {
+                return;
+            }
+            GdipSetClipRect(
+                self.graphics,
+                area.x,
+                area.y,
+                area.w,
+                area.h,
+                CombineModeIntersect,
+            );
+        }
+        draw(self);
+        unsafe {
+            GdipRestoreGraphics(self.graphics, saved);
         }
     }
 

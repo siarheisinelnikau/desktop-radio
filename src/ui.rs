@@ -45,6 +45,7 @@ impl Page {
 pub enum Toggle {
     Smooth,
     Intro,
+    WindowsStartup,
     Autoplay,
     StartupUpdates,
     Unavailable,
@@ -168,10 +169,38 @@ pub struct View<'a> {
     pub update: &'a UpdateDisplay,
     pub intro: Option<crate::intro::Frame>,
     pub save_failed: bool,
+    pub startup_failed: bool,
 }
 
 type A = Area;
 use Align::{Center, Left, Right};
+
+const METER: A = A::new(43., 161., 225., 83.);
+pub const METER_REDRAW: A = A::new(40., 158., 231., 89.);
+
+fn hero_background(canvas: &Canvas, p: Palette) {
+    canvas.gradient(
+        A::new(22., 87., 266., 451.),
+        19.,
+        p.hero_top,
+        p.panel,
+        blend(p.accent, p.outline, 80),
+    );
+}
+
+pub fn redraw_meter(canvas: &mut Canvas, view: &View<'_>) {
+    let palette = Palette::for_theme(&view.prefs.theme);
+    canvas.clipped(METER_REDRAW, |canvas| {
+        hero_background(canvas, palette);
+        Draw {
+            canvas,
+            view,
+            palette,
+            hits: Vec::new(),
+        }
+        .visualization(METER);
+    });
+}
 
 pub fn render(canvas: &mut Canvas, view: &View<'_>) -> Vec<Hit> {
     let palette = Palette::for_theme(&view.prefs.theme);
@@ -346,13 +375,7 @@ impl Draw<'_, '_> {
 
     fn hero(&mut self) {
         let p = self.palette;
-        self.canvas.gradient(
-            A::new(22., 87., 266., 451.),
-            19.,
-            p.hero_top,
-            p.panel,
-            blend(p.accent, p.outline, 80),
-        );
+        hero_background(self.canvas, p);
         let station = self.view.current.map(|index| &self.view.catalog.0[index]);
         let (status, is_live) = match self.view.status {
             Status::Playing(_) => ("On air", true),
@@ -393,7 +416,7 @@ impl Draw<'_, '_> {
         } else {
             self.text(badge, self.tr(status), 13, true, p.accent, Center);
         }
-        self.visualization(A::new(43., 161., 225., 83.));
+        self.visualization(METER);
         self.text(
             A::new(33., 257., 243., 47.),
             station.map_or(self.tr("Choose a station"), |s| s.name.as_str()),
@@ -883,7 +906,7 @@ impl Draw<'_, '_> {
         let prefs = self.view.prefs;
         self.card(A::new(22., 87., 326., 451.));
         self.card(A::new(362., 87., 336., 160.));
-        self.card(A::new(362., 260., 336., 278.));
+        self.card(A::new(362., 260., 336., 219.));
         self.text(
             A::new(38., 101., 275., 31.),
             self.tr("Appearance"),
@@ -935,7 +958,7 @@ impl Draw<'_, '_> {
         );
         self.text(
             A::new(378., 101., 302., 31.),
-            self.tr("Playback"),
+            self.tr("Startup and playback"),
             18,
             true,
             p.text,
@@ -943,17 +966,26 @@ impl Draw<'_, '_> {
         );
         self.switch(
             A::new(377., 138., 304., 36.),
+            Action::Toggle(Toggle::WindowsStartup),
+            prefs.start_with_windows,
+            self.tr("Start with Windows"),
+        );
+        self.switch(
+            A::new(377., 179., 304., 36.),
             Action::Toggle(Toggle::Autoplay),
             prefs.play_on_startup,
             self.tr("Resume last station on startup"),
         );
-        self.choice(
-            A::new(378., 188., 304., 43.),
-            Action::Page(Page::Stations),
-            self.tr("Manage stations"),
-            false,
-            14,
-        );
+        if self.view.startup_failed {
+            self.text(
+                A::new(378., 216., 304., 22.),
+                self.tr("Could not change Windows startup."),
+                13,
+                false,
+                p.accent,
+                Left,
+            );
+        }
         self.text(
             A::new(378., 273., 189., 32.),
             self.tr("Updates"),
@@ -1023,6 +1055,13 @@ impl Draw<'_, '_> {
                     .panel(A::new(378., 461., width, 5.), 2., p.accent, None);
             }
         }
+        self.choice(
+            A::new(362., 492., 336., 46.),
+            Action::Page(Page::Stations),
+            self.tr("Manage stations"),
+            false,
+            14,
+        );
     }
 
     fn segment_settings(

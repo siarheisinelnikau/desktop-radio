@@ -13,13 +13,14 @@ The executable contains the Rust runtime, audio decoders, station catalog, and a
 - Browse 268 stations from Belarus, Russia, Kazakhstan, and around the world. Search by name or frequency, save favorites, and control station order and visibility.
 - Play MP3, AAC, FLAC, and Ogg Vorbis radio streams. The player handles common HLS playlists and shows track metadata when a station publishes it.
 - Switch stations in the tray or with Windows media controls. Optionally resume the last station when the application starts.
+- Start Desktop Radio in the notification area when you sign in to Windows. This is enabled by default and can be disabled in Settings.
 - Shape the sound with a ten-band equalizer from 31 Hz to 16 kHz. Choose a live spectrum or waveform and a graphite or amber theme.
 - Use the interface in English, Russian, or Kazakh. Open the search field with Ctrl+F and close the panel with Escape.
 - Check for updates from Settings. The optional startup check runs in the background. An accepted update is verified against its published SHA-256 checksum before the executable is replaced.
 
 | Equalizer | Settings |
 | --- | --- |
-| ![Ten-band equalizer](docs/screenshots/equalizer.png) | ![Appearance, playback, and update settings](docs/screenshots/settings.png) |
+| ![Ten-band equalizer](docs/screenshots/equalizer.png) | ![Appearance, Windows startup, and update settings](docs/screenshots/settings.png) |
 
 | Amber theme | Station management |
 | --- | --- |

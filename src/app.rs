@@ -18,6 +18,7 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 use std::{
     cell::RefCell,
     ffi::{OsString, c_void},
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
@@ -29,11 +30,18 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::{
-        Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
+        Dwm::{
+            DWMWA_CLOAK, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush,
+            DwmSetWindowAttribute,
+        },
         Gdi::*,
     },
     System::{
         LibraryLoader::GetModuleHandleW,
+        Registry::{
+            HKEY_CURRENT_USER, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegGetValueW,
+            RegSetKeyValueW,
+        },
         Threading::{CreateMutexW, GetCurrentProcess, GetProcessTimes},
     },
     UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
@@ -45,6 +53,7 @@ const TRAY: u32 = WM_APP + 2;
 const ACTIVATE: u32 = WM_APP + 3;
 const EDIT_KEY: u32 = WM_APP + 4;
 const METER_TIMER: usize = 1;
+const METER_FRAME_MS: u32 = 15;
 const INTRO_TIMER: usize = 2;
 const SAVE_TIMER: usize = 3;
 const DIAG_TIMER: usize = 4;
@@ -88,12 +97,30 @@ pub fn run() -> Result<()> {
             unicode(&arguments[3])?.parse()?,
             unicode(&arguments[4])?,
         ),
-        ("--diagnose-ui", 2) => run_window(Some(PathBuf::from(&arguments[1])), false),
+        ("--diagnose-ui", 2) => run_window(
+            Some(Diagnostics::new(PathBuf::from(&arguments[1]))),
+            false,
+            false,
+        ),
+        ("--diagnose-meter", 4) => {
+            let mode = unicode(&arguments[3])?;
+            ensure!(
+                matches!(mode, "spectrum" | "waveform"),
+                "Unknown visualization mode"
+            );
+            let path = Path::new(&arguments[2]).canonicalize()?;
+            let source = url::Url::from_file_path(&path)
+                .map_err(|_| anyhow::anyhow!("Invalid audio test file path"))?;
+            let mut report = Diagnostics::new(PathBuf::from(&arguments[1]));
+            report.meter_source = Some((source.to_string(), mode.to_owned()));
+            run_window(Some(report), false, false)
+        }
         ("--cleanup-update" | "--update-failed", 2) => {
             updates::cleanup(unicode(&arguments[1])?);
-            run_window(None, action == "--update-failed")
+            run_window(None, action == "--update-failed", false)
         }
-        ("", 0) => run_window(None, false),
+        ("", 0) => run_window(None, false, false),
+        ("--autostart", 1) => run_window(None, false, true),
         _ => bail!("Unknown arguments"),
     }
 }
@@ -102,7 +129,7 @@ fn unicode(string: &OsString) -> Result<&str> {
     string.to_str().context("Invalid Unicode argument")
 }
 
-fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
+fn run_window(report: Option<Diagnostics>, update_failed: bool, autostart: bool) -> Result<()> {
     let _gdi = GdiPlus::start()?;
     let _instance_guard = if report.is_none() {
         let mutex = unsafe { CreateMutexW(null(), 0, wide("Local\\DesktopRadio.Rust").as_ptr()) };
@@ -110,6 +137,9 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
         let exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
         let guard = InstanceGuard(mutex);
         if exists {
+            if autostart {
+                return Ok(());
+            }
             for _ in 0..20 {
                 let window = unsafe { FindWindowW(wide(CLASS).as_ptr(), null()) };
                 if !window.is_null() {
@@ -129,6 +159,9 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
     let diagnostic = report.is_some();
     let window = create_window(diagnostic)?;
     let mut app = App::new(window, report)?;
+    if autostart && !app.prefs.start_with_windows {
+        return Ok(());
+    }
     if update_failed {
         app.update = UpdateDisplay::InstallFailed;
         app.set_page(Page::Settings);
@@ -136,11 +169,23 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
     APP.with(|state| *state.borrow_mut() = Some(app));
     with_app(|app| {
         if diagnostic {
-            app.show(true);
+            let measure_meter = app
+                .report
+                .as_ref()
+                .is_some_and(|report| report.meter_source.is_some());
+            app.show(!measure_meter);
             unsafe {
-                SetTimer(window, DIAG_TIMER, 3100, None);
+                SetTimer(
+                    window,
+                    DIAG_TIMER,
+                    if measure_meter { 100 } else { 3100 },
+                    None,
+                );
             }
         } else {
+            if !autostart {
+                app.startup_failed = set_windows_startup(app.prefs.start_with_windows).is_err();
+            }
             if app.prefs.play_on_startup {
                 if let Some(index) = app.current {
                     app.tune(index);
@@ -149,7 +194,7 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
             if app.prefs.check_updates_on_startup && !update_failed {
                 app.check_update(false);
             }
-            if update_failed || !app.tray.registered {
+            if update_failed || (!autostart && !app.tray.registered) {
                 app.show(!update_failed);
             }
         }
@@ -170,6 +215,64 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
     if message.wParam != 0 {
         bail!("Desktop Radio diagnostics failed");
     }
+    Ok(())
+}
+
+fn set_windows_startup(enabled: bool) -> Result<()> {
+    let key = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let name = wide("DesktopRadio");
+    if !enabled {
+        let result = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+        ensure!(
+            matches!(
+                result,
+                ERROR_SUCCESS | ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND
+            ),
+            "Remove the Desktop Radio startup entry (Windows error {result})"
+        );
+        return Ok(());
+    }
+
+    let path = std::env::current_exe().context("Locate Desktop Radio")?;
+    let command = std::iter::once(b'"' as u16)
+        .chain(path.as_os_str().encode_wide())
+        .chain(wide("\" --autostart"))
+        .collect::<Vec<_>>();
+    ensure!(
+        command.len() <= 261,
+        "Desktop Radio startup command is too long"
+    );
+    let size = size_of_val(command.as_slice()) as u32;
+    let mut previous = vec![0_u16; command.len()];
+    let mut previous_size = size;
+    let found = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            null_mut(),
+            previous.as_mut_ptr().cast(),
+            &mut previous_size,
+        )
+    };
+    if found == ERROR_SUCCESS && previous_size == size && previous == command {
+        return Ok(());
+    }
+    let result = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            name.as_ptr(),
+            REG_SZ,
+            command.as_ptr().cast(),
+            size,
+        )
+    };
+    ensure!(
+        result == ERROR_SUCCESS,
+        "Register Desktop Radio at startup (Windows error {result})"
+    );
     Ok(())
 }
 
@@ -279,11 +382,12 @@ struct App {
     drag: Option<Action>,
     scale: f32,
     dirty: bool,
+    meter_dirty: bool,
     visible: bool,
     meter: Meter,
     intro: Option<Animation>,
-    prior_player: bool,
     save_failed: bool,
+    startup_failed: bool,
     release: Option<Release>,
     update: UpdateDisplay,
     checking: bool,
@@ -294,7 +398,7 @@ struct App {
 }
 
 impl App {
-    fn new(window: HWND, report: Option<PathBuf>) -> Result<Self> {
+    fn new(window: HWND, report: Option<Diagnostics>) -> Result<Self> {
         let diagnostic = report.is_some();
         let settings = data_dir().join("settings.json");
         let mut prefs = if diagnostic {
@@ -305,6 +409,13 @@ impl App {
         let catalog = Catalog::load();
         if diagnostic {
             apply_fixture(&mut prefs);
+        }
+        if let Some((_, mode)) = report
+            .as_ref()
+            .and_then(|report| report.meter_source.as_ref())
+        {
+            prefs.visualization = mode.clone();
+            prefs.volume = 0;
         }
         let current = prefs.station_id.as_deref().and_then(|id| catalog.get(id));
         let (sender, events) = mpsc::channel();
@@ -368,15 +479,16 @@ impl App {
             drag: None,
             scale: 1.,
             dirty: true,
+            meter_dirty: false,
             visible: false,
             meter: Meter::new(),
             intro: None,
-            prior_player: false,
             save_failed: false,
+            startup_failed: false,
             release: None,
             update: UpdateDisplay::Blank,
             checking: false,
-            report: report.map(Diagnostics::new),
+            report,
             renders: 0,
             presents: 0,
             tray_tip: String::new(),
@@ -576,32 +688,112 @@ impl App {
         unsafe {
             let mut paint = PAINTSTRUCT::default();
             let dc = BeginPaint(self.window, &mut paint);
-            if self.visible && !dc.is_null() {
-                let mut rectangle = RECT::default();
-                GetClientRect(self.window, &mut rectangle);
-                let (width, height) = (rectangle.right, rectangle.bottom);
-                if width > 0 && height > 0 {
-                    let surface_replaced = self
-                        .surface
-                        .as_ref()
-                        .is_none_or(|surface| surface.width != width || surface.height != height);
-                    if surface_replaced {
-                        self.surface = Surface::new(width, height).ok();
-                    }
-                    if let Some(surface) = &self.surface {
-                        if self.dirty || surface_replaced {
-                            if let Ok(mut canvas) = Canvas::open(surface.dc, self.scale) {
-                                self.hits = ui::render(&mut canvas, &self.view(true));
-                                self.renders += 1;
-                                self.dirty = false;
-                            }
-                        }
-                        surface.blit(dc);
-                        self.presents += 1;
+            let meter_only = self.meter_dirty && !self.dirty;
+            if self.visible
+                && !dc.is_null()
+                && self.render_client()
+                && self
+                    .surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.blit(dc))
+            {
+                self.presents += 1;
+                if meter_only {
+                    if let Some(report) = &mut self.report {
+                        report
+                            .meter_presents
+                            .push(report.start.elapsed().as_secs_f64() * 1000.);
                     }
                 }
             }
             EndPaint(self.window, &paint);
+        }
+    }
+
+    fn render_client(&mut self) -> bool {
+        let mut rectangle = RECT::default();
+        if unsafe { GetClientRect(self.window, &mut rectangle) } == 0 {
+            return false;
+        }
+        let (width, height) = (rectangle.right, rectangle.bottom);
+        if width <= 0 || height <= 0 {
+            return false;
+        }
+        if self
+            .surface
+            .as_ref()
+            .is_none_or(|surface| surface.width != width || surface.height != height)
+        {
+            self.surface = Surface::new(width, height).ok();
+            self.dirty = true;
+        }
+        let Some(surface) = &self.surface else {
+            return false;
+        };
+        if self.dirty || self.meter_dirty {
+            let Ok(mut canvas) = Canvas::open(surface.dc, self.scale) else {
+                return false;
+            };
+            if self.dirty {
+                self.hits = ui::render(&mut canvas, &self.view(true));
+            } else {
+                ui::redraw_meter(&mut canvas, &self.view(true));
+            }
+            self.renders += 1;
+            self.dirty = false;
+            self.meter_dirty = false;
+        }
+        true
+    }
+
+    fn set_cloak(&self, cloaked: bool) -> bool {
+        let cloaked = i32::from(cloaked);
+        unsafe {
+            DwmSetWindowAttribute(
+                self.window,
+                DWMWA_CLOAK as u32,
+                (&raw const cloaked).cast(),
+                size_of_val(&cloaked) as u32,
+            ) >= 0
+        }
+    }
+
+    fn present_opening_cover(
+        &mut self,
+        prepared: bool,
+        background: COLORREF,
+    ) -> (bool, Option<bool>) {
+        unsafe {
+            let dc = GetDC(self.window);
+            if dc.is_null() {
+                return (false, None);
+            }
+            let presented = if prepared {
+                self.surface
+                    .as_ref()
+                    .is_some_and(|surface| surface.blit(dc))
+            } else {
+                let mut area = RECT::default();
+                GetClientRect(self.window, &mut area);
+                let brush = CreateSolidBrush(background);
+                let painted = !brush.is_null() && FillRect(dc, &area, brush) != 0;
+                if !brush.is_null() {
+                    DeleteObject(brush);
+                }
+                painted
+            };
+            GdiFlush();
+            let client_covered = self.report.is_some().then(|| {
+                let mut area = RECT::default();
+                GetClientRect(self.window, &mut area) != 0
+                    && GetPixel(dc, area.right / 4, area.bottom / 4) == background
+                    && GetPixel(dc, area.right * 3 / 4, area.bottom / 2) == background
+            });
+            ReleaseDC(self.window, dc);
+            if presented {
+                self.presents += 1;
+            }
+            (presented, client_covered)
         }
     }
 
@@ -628,6 +820,7 @@ impl App {
             update: &self.update,
             intro: self.intro.as_ref().map(Animation::frame),
             save_failed: self.save_failed,
+            startup_failed: self.startup_failed,
         }
     }
 
@@ -699,37 +892,75 @@ impl App {
             return;
         }
         self.place();
-        self.visible = true;
-        if self.page == Page::Player {
-            if intro
-                && self.prefs.show_intro
-                && (self.report.is_some() || client_animations_enabled())
-                && unsafe { SetTimer(self.window, INTRO_TIMER, FRAME_MS, None) } != 0
-            {
-                self.intro = Some(Animation::new(Instant::now(), self.prior_player));
-                if let Some(report) = &mut self.report {
-                    report.intro_start = Some((cpu_milliseconds(), self.renders));
-                }
+        let play_intro = intro
+            && self.page == Page::Player
+            && self.prefs.show_intro
+            && (self.report.is_some() || client_animations_enabled())
+            && self.set_cloak(true);
+        let background = color_ref(Palette::for_theme(&self.prefs.theme).window);
+        self.dirty = true;
+        if play_intro {
+            self.intro = Some(Animation::new(Instant::now()));
+            if let Some(report) = &mut self.report {
+                report.intro_start = Some((cpu_milliseconds(), self.renders));
             }
-            self.prior_player = true;
         }
+        let prepared = play_intro && self.render_client();
+        // A hidden tray window can still have its previous pixels in the compositor.
+        // Keep it cloaked until the covered frame has reached the window DC.
+        self.visible = true;
+        self.show_edit();
         unsafe {
             ShowWindow(
                 self.window,
-                if self.report.is_some() {
+                if play_intro || self.report.is_some() {
                     SW_SHOWNOACTIVATE
                 } else {
                     SW_SHOW
                 },
             );
-            if self.report.is_none() {
+        }
+        if play_intro {
+            let (presented, client_covered) = self.present_opening_cover(prepared, background);
+            let compositor_ready = presented && unsafe { DwmFlush() } >= 0;
+            let uncloaked = self.set_cloak(false);
+            if let Some(report) = &mut self.report {
+                let covered = prepared
+                    && self.surface.as_ref().is_some_and(|surface| {
+                        [(0.12, 0.12), (0.84, 0.15), (0.50, 0.51), (0.80, 0.86)]
+                            .into_iter()
+                            .all(|(x, y)| unsafe {
+                                GetPixel(
+                                    surface.dc,
+                                    (surface.width as f32 * x) as i32,
+                                    (surface.height as f32 * y) as i32,
+                                ) == background
+                            })
+                    });
+                report.opening_frames.push(serde_json::json!({
+                    "covered": covered, "client_covered": client_covered, "presented": presented,
+                    "compositor_ready": compositor_ready, "uncloaked": uncloaked,
+                    "edit_visible": unsafe { IsWindowVisible(self.edit) } != 0,
+                }));
+            }
+            self.intro = Some(Animation::new(Instant::now()));
+            if !presented {
+                self.mark_dirty();
+            }
+            if unsafe { SetTimer(self.window, INTRO_TIMER, FRAME_MS, None) } == 0 {
+                self.end_intro();
+            }
+        }
+        if self.report.is_none() {
+            unsafe {
                 SetForegroundWindow(self.window);
                 SetFocus(self.window);
             }
         }
-        self.show_edit();
         self.meter_schedule();
-        self.mark_dirty();
+        if !prepared {
+            self.mark_dirty();
+        }
     }
 
     fn hide(&mut self) {
@@ -742,7 +973,6 @@ impl App {
         }
         self.visible = false;
         if self.intro.take().is_some() {
-            self.prior_player = false;
             if let Some(report) = &mut self.report {
                 report.intro_start = None;
             }
@@ -840,9 +1070,6 @@ impl App {
         self.page = page;
         if self.intro.is_some() {
             self.end_intro();
-        }
-        if self.visible && page == Page::Player {
-            self.prior_player = true;
         }
         self.hot = None;
         self.focus = None;
@@ -982,6 +1209,7 @@ impl App {
             }
             Action::Meter(mode) => {
                 self.prefs.visualization = mode.into();
+                self.meter.reset();
                 self.meter_schedule();
                 self.save_later();
             }
@@ -989,6 +1217,20 @@ impl App {
                 match flag {
                     Toggle::Smooth => self.prefs.smooth_visualization ^= true,
                     Toggle::Intro => self.prefs.show_intro ^= true,
+                    Toggle::WindowsStartup => {
+                        let enabled = !self.prefs.start_with_windows;
+                        self.startup_failed = set_windows_startup(enabled).is_err();
+                        if !self.startup_failed {
+                            self.prefs.start_with_windows = enabled;
+                            self.save();
+                            if self.save_failed {
+                                self.prefs.start_with_windows = !enabled;
+                                self.startup_failed = set_windows_startup(!enabled).is_err();
+                            }
+                        }
+                        self.mark_dirty();
+                        return;
+                    }
                     Toggle::Autoplay => self.prefs.play_on_startup ^= true,
                     Toggle::StartupUpdates => self.prefs.check_updates_on_startup ^= true,
                     Toggle::Unavailable => self.prefs.hide_unavailable ^= true,
@@ -1383,7 +1625,7 @@ impl App {
         self.engine.watch(run);
         unsafe {
             if run {
-                SetTimer(self.window, METER_TIMER, 74, None);
+                SetTimer(self.window, METER_TIMER, METER_FRAME_MS, None);
             } else {
                 KillTimer(self.window, METER_TIMER);
             }
@@ -1392,10 +1634,31 @@ impl App {
 
     fn timer(&mut self, id: usize) {
         match id {
-            METER_TIMER if self.visible => {
+            METER_TIMER
+                if self.visible
+                    && self.page == Page::Player
+                    && self.intro.is_none()
+                    && self.prefs.visualization != "off"
+                    && matches!(self.status, Status::Playing(_)) =>
+            {
                 let signal = self.engine.signal();
-                if self.meter.update(signal, self.prefs.smooth_visualization) {
-                    self.mark_dirty();
+                let waveform = self.prefs.visualization == "waveform";
+                if self
+                    .meter
+                    .update(signal, self.prefs.smooth_visualization, waveform)
+                {
+                    self.meter_dirty = true;
+                    let area = ui::METER_REDRAW;
+                    let scale = self.scale;
+                    let bounds = RECT {
+                        left: (area.x * scale).floor() as i32,
+                        top: (area.y * scale).floor() as i32,
+                        right: (area.right() * scale).ceil() as i32,
+                        bottom: (area.bottom() * scale).ceil() as i32,
+                    };
+                    unsafe {
+                        InvalidateRect(self.window, &bounds, 0);
+                    }
                 }
             }
             INTRO_TIMER => {
@@ -1555,6 +1818,14 @@ impl App {
     }
 
     fn diagnose(&mut self) {
+        if self
+            .report
+            .as_ref()
+            .is_some_and(|report| report.meter_source.is_some())
+        {
+            self.diagnose_meter();
+            return;
+        }
         let Some(diagnostic) = &mut self.report else {
             return;
         };
@@ -1623,7 +1894,7 @@ impl App {
                 let result = serde_json::json!({"pid": std::process::id(), "backend": "GDI+ into memory DIB; Win32 BitBlt",
                     "native_tray_registered": self.tray.registered, "media_session_attached": self.media.is_some(),
                     "native_icon_loaded": !self.tray.icon.is_null(), "tray_icon_rect": self.tray.rect().is_some(),
-                    "samples": diagnostic.samples, "intros": diagnostic.intros});
+                    "samples": diagnostic.samples, "intros": diagnostic.intros, "opening_frames": diagnostic.opening_frames});
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
                         .is_ok();
@@ -1633,6 +1904,54 @@ impl App {
                 }
                 return;
             }
+        }
+    }
+
+    fn diagnose_meter(&mut self) {
+        let diagnostic = self.report.as_mut().unwrap();
+        let phase = diagnostic.phase;
+        diagnostic.phase += 1;
+        diagnostic.samples.push(serde_json::json!({
+            "ms": diagnostic.start.elapsed().as_secs_f64() * 1000.,
+            "cpu_ms": cpu_milliseconds(), "render": self.renders, "present": self.presents,
+            "visible": self.visible, "playing": matches!(self.status, Status::Playing(_)),
+            "meter_presents": diagnostic.meter_presents.len(),
+        }));
+        let interval = match phase {
+            0 => {
+                let mut station = self.catalog.0[self.current.unwrap_or_default()].clone();
+                station.streams = vec![diagnostic.meter_source.as_ref().unwrap().0.clone()];
+                station.track_source_id = None;
+                self.revision = self.engine.play(station);
+                1500
+            }
+            1 => 5200,
+            2 => {
+                self.hide();
+                1500
+            }
+            3 => {
+                self.show(false);
+                1800
+            }
+            _ => {
+                let diagnostic = self.report.take().unwrap();
+                let result = serde_json::json!({
+                    "mode": diagnostic.meter_source.as_ref().unwrap().1,
+                    "samples": diagnostic.samples, "meter_presents_ms": diagnostic.meter_presents,
+                });
+                let saved =
+                    std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
+                        .is_ok();
+                unsafe {
+                    KillTimer(self.window, DIAG_TIMER);
+                    PostQuitMessage(if saved { 0 } else { 1 });
+                }
+                return;
+            }
+        };
+        unsafe {
+            SetTimer(self.window, DIAG_TIMER, interval, None);
         }
     }
 }
@@ -1800,8 +2119,11 @@ struct Meter {
     input: [Complex32; METER_SIZE],
     spectrum: [f32; 16],
     waveform: [f32; 100],
+    spectrum_target: [f32; 16],
+    waveform_target: [f32; 100],
     ready: bool,
     revision: u64,
+    updated: Instant,
 }
 
 impl Meter {
@@ -1814,8 +2136,11 @@ impl Meter {
             input: [Complex32::new(0., 0.); METER_SIZE],
             spectrum: [0.; 16],
             waveform: [0.; 100],
+            spectrum_target: [0.; 16],
+            waveform_target: [0.; 100],
             ready: false,
             revision: 0,
+            updated: Instant::now(),
         }
     }
 
@@ -1823,6 +2148,8 @@ impl Meter {
         self.ready = false;
         self.spectrum.fill(0.);
         self.waveform.fill(0.);
+        self.spectrum_target.fill(0.);
+        self.waveform_target.fill(0.);
     }
     fn spectrum(&self) -> &[f32] {
         if self.ready { &self.spectrum } else { &[] }
@@ -1831,17 +2158,59 @@ impl Meter {
         if self.ready { &self.waveform } else { &[] }
     }
 
-    fn update(&mut self, signal: Signal, smooth: bool) -> bool {
-        if signal.revision == self.revision || signal.revision == 0 {
+    fn update(&mut self, signal: Signal, smooth: bool, waveform: bool) -> bool {
+        let fresh = signal.revision != 0 && signal.revision != self.revision;
+        if fresh {
+            self.revision = signal.revision;
+            if waveform {
+                let count = self.waveform_target.len();
+                for (index, target) in self.waveform_target.iter_mut().enumerate() {
+                    let low = index * METER_SIZE / count;
+                    let high = (index + 1) * METER_SIZE / count;
+                    *target =
+                        signal.values[low..high].iter().sum::<f32>() / (high - low) as f32 * 2.2;
+                }
+            } else {
+                self.analyze_spectrum(&signal);
+            }
+        }
+        if !self.ready && !fresh {
             return false;
         }
-        self.revision = signal.revision;
+        let now = Instant::now();
+        let seconds = now.duration_since(self.updated).as_secs_f32();
+        self.updated = now;
+        let animate = self.ready && smooth;
+        let first = !self.ready;
         self.ready = true;
+        let changed = if waveform {
+            follow_signal(
+                &mut self.waveform,
+                &self.waveform_target,
+                animate,
+                seconds,
+                58.,
+                58.,
+            )
+        } else {
+            follow_signal(
+                &mut self.spectrum,
+                &self.spectrum_target,
+                animate,
+                seconds,
+                58.,
+                8.,
+            )
+        };
+        first || changed
+    }
+
+    fn analyze_spectrum(&mut self, signal: &Signal) {
         for (index, buffered) in self.input.iter_mut().enumerate() {
             *buffered = Complex32::new(signal.values[index] * self.window[index], 0.);
         }
         self.fft.process(&mut self.input);
-        for (index, level) in self.spectrum.iter_mut().enumerate() {
+        for (index, target) in self.spectrum_target.iter_mut().enumerate() {
             let bin = |step: usize| {
                 (39. * 1.45_f32.powi(step as i32) * METER_SIZE as f32 / signal.rate as f32) as usize
             };
@@ -1855,26 +2224,33 @@ impl Meter {
                 * (power * 16. / (METER_SIZE * METER_SIZE) as f32)
                     .max(1e-10)
                     .log10();
-            let target = ((db + 61.) / 61.).clamp(0., 1.);
-            *level = if smooth {
-                target.max(*level * 0.82)
-            } else {
-                target
-            };
+            *target = ((db + 61.) / 61.).clamp(0., 1.);
         }
-        let count = self.waveform.len();
-        for (index, sample) in self.waveform.iter_mut().enumerate() {
-            let low = index * METER_SIZE / count;
-            let high = (index + 1) * METER_SIZE / count;
-            let value = signal.values[low..high].iter().sum::<f32>() / (high - low) as f32 * 2.2;
-            *sample = if smooth {
-                0.35 * *sample + 0.65 * value
-            } else {
-                value
-            };
-        }
-        true
     }
+}
+
+fn follow_signal(
+    levels: &mut [f32],
+    targets: &[f32],
+    animate: bool,
+    seconds: f32,
+    attack: f32,
+    release: f32,
+) -> bool {
+    let rising = 1. - (-seconds * attack).exp();
+    let falling = 1. - (-seconds * release).exp();
+    let mut changed = false;
+    for (level, &target) in levels.iter_mut().zip(targets) {
+        let delta = target - *level;
+        let next = if !animate || delta.abs() < 0.005 {
+            target
+        } else {
+            *level + delta * if delta > 0. { rising } else { falling }
+        };
+        changed |= next != *level;
+        *level = next;
+    }
+    changed
 }
 
 struct Diagnostics {
@@ -1884,6 +2260,9 @@ struct Diagnostics {
     samples: Vec<serde_json::Value>,
     intro_start: Option<(f64, u64)>,
     intros: Vec<serde_json::Value>,
+    opening_frames: Vec<serde_json::Value>,
+    meter_source: Option<(String, String)>,
+    meter_presents: Vec<f64>,
 }
 
 impl Diagnostics {
@@ -1895,6 +2274,9 @@ impl Diagnostics {
             samples: Vec::new(),
             intro_start: None,
             intros: Vec::new(),
+            opening_frames: Vec::new(),
+            meter_source: None,
+            meter_presents: Vec::new(),
         }
     }
 }
@@ -1954,10 +2336,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
             (0. ..=END_MS).contains(&time),
             "Screenshot time is outside the intro"
         );
-        (
-            Page::Player,
-            Some(Frame::at(time, screen == "intro-return")),
-        )
+        (Page::Player, Some(Frame::at(time)))
     } else {
         ensure!(
             arguments.len() < 5,
@@ -2004,7 +2383,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
             + sine(606.) * 0.07
             + sine(1852.) * 0.035;
     }
-    meter.update(signal, false);
+    meter.update(signal, false, prefs.visualization == "waveform");
     let surface = Surface::new(WIDTH, HEIGHT)?;
     {
         let mut canvas = Canvas::open(surface.dc, 1.)?;
@@ -2028,6 +2407,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
                 update: &UpdateDisplay::Blank,
                 intro: frame,
                 save_failed: false,
+                startup_failed: false,
             },
         );
     }
