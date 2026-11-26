@@ -50,6 +50,7 @@ pub fn lookup(english: &str, language: &str) -> Option<&'static str> {
         "General settings" => ("Общие настройки", "Жалпы баптаулар"),
         "Go back" => ("Назад", "Артқа"),
         "Graphite" => ("Графит", "Графит"),
+        "Hide station list" => ("Свернуть список станций", "Станциялар тізімін жию"),
         "Hide recently unavailable stations" => (
             "Скрывать недавно недоступные станции",
             "Жақында қолжетімсіз болған станцияларды жасыру",
@@ -101,6 +102,7 @@ pub fn lookup(english: &str, language: &str) -> Option<&'static str> {
             "Атауы немесе жиілігі бойынша іздеу",
         ),
         "Settings" => ("Настройки", "Баптаулар"),
+        "Show station list" => ("Развернуть список станций", "Станциялар тізімін ашу"),
         "Show intro when opening the panel" => {
             ("Заставка при открытии панели", "Панель ашылғанда заставка")
         }

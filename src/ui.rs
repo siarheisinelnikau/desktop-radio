@@ -1,10 +1,11 @@
 use crate::{
     audio::Status,
-    canvas::{Align, Area, Canvas, Color, blend, rgb},
+    canvas::{Align, Area, Canvas, Color, alpha, blend, rgb},
     model::{Catalog, FAVORITES, FREQUENCIES, GROUPS, Preferences, group_name, label},
 };
 
 pub const WIDTH: i32 = 720;
+pub const COMPACT_WIDTH: i32 = 310;
 pub const HEIGHT: i32 = 570;
 pub const EDIT: Area = Area::new(347., 141., 333., 21.);
 pub const LIST: Area = Area::new(307., 184., 390., 352.);
@@ -55,6 +56,7 @@ pub enum Toggle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Close,
+    ToggleStationList,
     Page(Page),
     Group(&'static str),
     GroupVisible(&'static str),
@@ -153,6 +155,8 @@ impl Palette {
 
 pub struct View<'a> {
     pub page: Page,
+    pub width: f32,
+    pub station_list_ready: bool,
     pub prefs: &'a Preferences,
     pub catalog: &'a Catalog,
     pub current: Option<usize>,
@@ -205,7 +209,7 @@ pub fn redraw_meter(canvas: &mut Canvas, view: &View<'_>) {
 pub fn render(canvas: &mut Canvas, view: &View<'_>) -> Vec<Hit> {
     let palette = Palette::for_theme(&view.prefs.theme);
     if let Some(frame) = view.intro {
-        let scene = crate::intro::Scene::new(frame);
+        let scene = crate::intro::Scene::new(frame, view.width);
         if let Some((pivot, scale)) = scene.content() {
             canvas.clear(palette.window);
             canvas.transformed(pivot, (scale, scale), pivot, |canvas| {
@@ -235,13 +239,18 @@ fn draw_page(canvas: &mut Canvas, view: &View<'_>, palette: Palette) -> Vec<Hit>
     }
     if view.save_failed {
         surface.text(
-            A::new(23., 540., 673., 23.),
+            A::new(23., 540., view.width - 47., 23.),
             surface.tr("Could not save settings."),
             12,
             false,
             surface.palette.accent,
             Left,
         );
+    }
+    if view.page == Page::Player
+        && [view.hot, view.focus].contains(&Some(Action::ToggleStationList))
+    {
+        surface.station_list_hint();
     }
     surface.hits
 }
@@ -323,6 +332,7 @@ impl Draw<'_, '_> {
     fn header(&mut self) {
         let p = self.palette;
         let back = self.view.page != Page::Player;
+        let right = self.view.width - 22.;
         let title = match self.view.page {
             Page::Player => "Desktop Radio",
             Page::Equalizer => self.tr("Equalizer"),
@@ -335,24 +345,63 @@ impl Draw<'_, '_> {
         } else {
             self.logo(mark);
         }
-        self.text(A::new(73., 17., 435., 41.), title, 24, true, p.text, Left);
-        let close = A::new(660., 18., 38., 40.);
-        self.icon_button(close, Action::Close, Icon::Close, false);
+        let title_opacity = ((self.view.width - 434.) / 42.).clamp(0., 1.);
+        if title_opacity > 0. {
+            self.text(
+                A::new(73., 17., right - if back { 121. } else { 271. }, 41.),
+                title,
+                24,
+                true,
+                alpha(p.text, title_opacity),
+                Left,
+            );
+        }
         if !back {
             self.icon_button(
-                A::new(610., 18., 40., 40.),
-                Action::Page(Page::Settings),
-                Icon::Gear,
+                A::new(right - 188., 18., 40., 40.),
+                Action::ToggleStationList,
+                Icon::StationList(self.view.prefs.station_list_collapsed),
                 false,
             );
             self.icon_button(
-                A::new(560., 18., 40., 40.),
+                A::new(right - 138., 18., 40., 40.),
                 Action::Page(Page::Equalizer),
                 Icon::Equalizer,
                 self.view.prefs.equalizer_enabled,
             );
+            self.icon_button(
+                A::new(right - 88., 18., 40., 40.),
+                Action::Page(Page::Settings),
+                Icon::Gear,
+                false,
+            );
         }
-        self.canvas.line((22., 72.), (698., 72.), p.outline, 1.);
+        self.icon_button(
+            A::new(right - 38., 18., 38., 40.),
+            Action::Close,
+            Icon::Close,
+            false,
+        );
+        self.canvas.line((22., 72.), (right, 72.), p.outline, 1.);
+    }
+
+    fn station_list_hint(&mut self) {
+        let area = A::new((self.view.width - 276.).max(22.), 62., 216., 26.);
+        let hint = self.tr(if self.view.prefs.station_list_collapsed {
+            "Show station list"
+        } else {
+            "Hide station list"
+        });
+        self.canvas
+            .panel(area, 7., self.palette.raised, Some(self.palette.outline));
+        self.text(
+            area.inset(8., 0.),
+            hint,
+            12,
+            false,
+            self.palette.text,
+            Center,
+        );
     }
 
     fn logo(&self, area: A) {
@@ -368,6 +417,23 @@ impl Draw<'_, '_> {
 
     fn player(&mut self) {
         self.hero();
+        if self.view.station_list_ready {
+            self.station_list();
+        } else if self.view.width > LIST.x + 22. {
+            let area = A::new(LIST.x - 1., 86., self.view.width - LIST.x - 21., 453.);
+            self.canvas.clipped(area, |canvas| {
+                Draw {
+                    canvas,
+                    view: self.view,
+                    palette: self.palette,
+                    hits: Vec::new(),
+                }
+                .station_list();
+            });
+        }
+    }
+
+    fn station_list(&mut self) {
         self.group_tabs(A::new(307., 87., 391., 36.), false, false);
         self.search();
         self.rows(LIST, false);
@@ -1155,6 +1221,13 @@ impl Draw<'_, '_> {
                 line((-7., 0.), (-2., -5.));
                 line((-7., 0.), (-2., 5.));
             }
+            Icon::StationList(collapsed) => {
+                c.panel(A::new(x - 8., y - 6., 16., 12.), 2., 0, Some(color));
+                line((-2.5, -5.5), (-2.5, 5.5));
+                let dir = if collapsed { 1. } else { -1. };
+                line((2.6 - 1.5 * dir, -2.1), (2.6 + 1.5 * dir, 0.));
+                line((2.6 - 1.5 * dir, 2.1), (2.6 + 1.5 * dir, 0.));
+            }
             Icon::Up | Icon::Down => {
                 let dir = if matches!(icon, Icon::Up) { 1. } else { -1. };
                 line((-5., 2.5 * dir), (0., -2.5 * dir));
@@ -1241,6 +1314,7 @@ impl Draw<'_, '_> {
 enum Icon {
     Back,
     Close,
+    StationList(bool),
     Up,
     Down,
     Play,

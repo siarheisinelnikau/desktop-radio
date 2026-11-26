@@ -3,7 +3,7 @@
 use crate::{
     canvas::{Align, Area, Canvas, Color, Gradient, alpha, rgb},
     model::label,
-    ui::{HEIGHT, Palette, WIDTH},
+    ui::{HEIGHT, Palette},
 };
 use std::time::{Duration, Instant};
 
@@ -150,22 +150,20 @@ impl Metal {
     }
 }
 
-const VIEWPORT: Area = Area::new(0., 0., WIDTH as f32, HEIGHT as f32);
 const TITLE_HEIGHT: f32 = 29.;
 const CAPTION_HEIGHT: f32 = 17.;
 const MAST_HEIGHT: f32 = 150.;
 const MAST_SCALE: f32 = MAST_HEIGHT / 102.;
-const CX: f32 = WIDTH as f32 * 0.5;
 const TOP: f32 = (HEIGHT as f32
     - (MAST_HEIGHT + 18. + TITLE_HEIGHT + 10. + 9. + 2. + 10. + CAPTION_HEIGHT))
     * 0.5;
 const TITLE_TOP: f32 = TOP + MAST_HEIGHT + 18.;
 const DIAL_Y: f32 = TITLE_TOP + TITLE_HEIGHT + 10. + 9.;
 const CAPTION_TOP: f32 = DIAL_Y + 12.;
-const TIP_SCREEN: (f32, f32) = (CX, TOP + TIP.1 * MAST_SCALE);
 
 pub struct Scene {
     frame: Frame,
+    viewport: Area,
     open: f32,
     reveal: f32,
     leave: f32,
@@ -173,12 +171,13 @@ pub struct Scene {
 }
 
 impl Scene {
-    pub fn new(frame: Frame) -> Self {
+    pub fn new(frame: Frame, width: f32) -> Self {
         let t = frame.millis;
         let open = span(t, OPEN_START, END_MS).max(frame.dismiss);
         let leave = span(t, 1320., 1640.).max(frame.dismiss);
         Self {
             frame,
+            viewport: Area::new(0., 0., width, HEIGHT as f32),
             open,
             reveal: ease(t, 120., 420.),
             leave,
@@ -187,7 +186,11 @@ impl Scene {
     }
 
     pub fn content(&self) -> Option<((f32, f32), f32)> {
-        (self.open > 0.).then(|| (TIP_SCREEN, 0.92 + 0.08 * DECELERATE.at(self.open)))
+        (self.open > 0.).then(|| (self.tip(), 0.92 + 0.08 * DECELERATE.at(self.open)))
+    }
+
+    fn tip(&self) -> (f32, f32) {
+        (self.viewport.w * 0.5, TOP + TIP.1 * MAST_SCALE)
     }
 
     pub fn draw(&self, canvas: &mut Canvas, palette: Palette, language: &str) {
@@ -199,10 +202,11 @@ impl Scene {
 
         let accent = palette.accent;
         let display = self.reveal * self.strength * (1. - open);
-        let edge = HEIGHT.min(WIDTH) as f32;
+        let viewport = self.viewport;
+        let edge = viewport.h.min(viewport.w);
         glow(
             canvas,
-            Area::around((VIEWPORT.w * 0.94, VIEWPORT.h * 0.06), edge * 1.10),
+            Area::around((viewport.w * 0.94, viewport.h * 0.06), edge * 1.10),
             [
                 (0., alpha(accent, 0.09 * display)),
                 (0.5, alpha(accent, 0.025 * display)),
@@ -211,12 +215,12 @@ impl Scene {
         );
         glow(
             canvas,
-            Area::around((VIEWPORT.w * 0.03, VIEWPORT.h * 0.98), edge * 0.85),
+            Area::around((viewport.w * 0.03, viewport.h * 0.98), edge * 0.85),
             [(0., alpha(WARM, 0.035 * display)), (1., 0)],
         );
 
         let flight = 1. + 0.32 * ACCELERATE.at(self.leave);
-        canvas.transformed(TIP_SCREEN, (flight, flight), TIP_SCREEN, |canvas| {
+        canvas.transformed(self.tip(), (flight, flight), self.tip(), |canvas| {
             self.foreground(canvas, palette, language);
         });
     }
@@ -225,13 +229,16 @@ impl Scene {
         if open == 0. {
             canvas.clear(color);
         } else if open < 1. {
-            let reach = TIP_SCREEN
-                .0
-                .hypot(TIP_SCREEN.1.max(VIEWPORT.h - TIP_SCREEN.1));
-            let opening = Area::around(TIP_SCREEN, (reach * open / IRIS_CLEAR).max(1.));
+            let (x, y) = self.tip();
+            let reach = x.hypot(y.max(self.viewport.h - y));
+            let opening = Area::around((x, y), (reach * open / IRIS_CLEAR).max(1.));
             // Overlap the two antialiased edges so the feather has no visible seam.
             let mask = opening.inset(1.0, 1.0);
-            canvas.outside_ellipse(VIEWPORT, if mask.w > 0. { mask } else { opening }, color);
+            canvas.outside_ellipse(
+                self.viewport,
+                if mask.w > 0. { mask } else { opening },
+                color,
+            );
             glow(
                 canvas,
                 opening,
@@ -248,7 +255,8 @@ impl Scene {
         let t = self.frame.millis;
         let out = self.strength;
         let charge_now = charge(t);
-        let glow_center = (CX, TOP + 40. * MAST_SCALE);
+        let center = self.tip().0;
+        let glow_center = (center, TOP + 40. * MAST_SCALE);
         let radius = MAST_HEIGHT * 1.25;
         let opacity = self.reveal * out;
         glow(
@@ -272,7 +280,7 @@ impl Scene {
             if pulse > 0. && pulse < 1. {
                 let radius = MAST_HEIGHT * (0.10 + 1.05 * STANDARD.at(pulse));
                 canvas.arcs(
-                    Area::around(TIP_SCREEN, radius),
+                    Area::around(self.tip(), radius),
                     &[0.],
                     360.,
                     1.5,
@@ -282,7 +290,7 @@ impl Scene {
         }
 
         let shadow = Area::new(
-            CX - MAST_HEIGHT * 0.27,
+            center - MAST_HEIGHT * 0.27,
             TOP + 100.4 * MAST_SCALE - MAST_HEIGHT * 0.03,
             MAST_HEIGHT * 0.54,
             MAST_HEIGHT * 0.06,
@@ -295,7 +303,7 @@ impl Scene {
         let sy = MAST_SCALE * (0.91 + 0.09 * self.reveal);
         let sx = sy * (0.90 + 0.10 * self.reveal);
         let origin = (
-            CX - 60. * sx,
+            center - 60. * sx,
             TOP + (MAST_HEIGHT - 102. * sy) * 0.5 + 6. * (1. - self.reveal),
         );
         let steel = mix(p.muted, p.outline, 0.30);
@@ -316,7 +324,7 @@ impl Scene {
                 Area::new(
                     16.,
                     TITLE_TOP + 6. * (1. - title),
-                    VIEWPORT.w - 32.,
+                    self.viewport.w - 32.,
                     TITLE_HEIGHT,
                 ),
                 "Desktop Radio",
@@ -326,14 +334,14 @@ impl Scene {
                 Align::Center,
             );
         }
-        draw_dial(canvas, t, p, charge_now, out);
+        draw_dial(canvas, center, t, p, charge_now, out);
         let caption = ease(t, 500., 760.);
         if caption > 0. {
             canvas.text(
                 Area::new(
                     16.,
                     CAPTION_TOP + 6. * (1. - caption),
-                    VIEWPORT.w - 32.,
+                    self.viewport.w - 32.,
                     CAPTION_HEIGHT,
                 ),
                 label("Internet radio", language),
@@ -553,7 +561,7 @@ fn draw_tip(canvas: &mut Canvas, t: f32, metal: &Metal, accent: Color, out: f32)
     });
 }
 
-fn draw_dial(canvas: &Canvas, t: f32, p: Palette, charge_now: f32, out: f32) {
+fn draw_dial(canvas: &Canvas, center: f32, t: f32, p: Palette, charge_now: f32, out: f32) {
     let drawn = ease(t, 420., 700.);
     if drawn <= 0. {
         return;
@@ -562,12 +570,12 @@ fn draw_dial(canvas: &Canvas, t: f32, p: Palette, charge_now: f32, out: f32) {
     let tint = alpha(p.accent, (0.55 + 0.45 * charge_now) * out);
     let clear = alpha(p.accent, 0.);
     if let Some(rule) = Gradient::linear(
-        (CX - HALF, 0.),
-        (CX + HALF, 0.),
+        (center - HALF, 0.),
+        (center + HALF, 0.),
         [(0., clear), (0.5, tint), (1., clear)],
     ) {
         canvas.gradient_panel(
-            Area::new(CX - HALF * drawn, DIAL_Y, 2. * HALF * drawn, 2.),
+            Area::new(center - HALF * drawn, DIAL_Y, 2. * HALF * drawn, 2.),
             0.,
             &rule,
         );
@@ -578,7 +586,7 @@ fn draw_dial(canvas: &Canvas, t: f32, p: Palette, charge_now: f32, out: f32) {
         if appear <= 0. {
             continue;
         }
-        let x = CX + tick as f32 * 9.;
+        let x = center + tick as f32 * 9.;
         let major = tick % 5 == 0;
         canvas.line(
             (x, DIAL_Y - if major { 8. } else { 4.5 }),
@@ -594,7 +602,7 @@ fn draw_dial(canvas: &Canvas, t: f32, p: Palette, charge_now: f32, out: f32) {
     if visible <= 0. {
         return;
     }
-    let x = CX - HALF + 2. * HALF * (0.06 + 0.44 * BACK.at(span(t, 450., 780.)));
+    let x = center - HALF + 2. * HALF * (0.06 + 0.44 * BACK.at(span(t, 450., 780.)));
     glow(
         canvas,
         Area::around((x, DIAL_Y - 3.), 16.),
@@ -617,18 +625,19 @@ fn draw_dial(canvas: &Canvas, t: f32, p: Palette, charge_now: f32, out: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::{COMPACT_WIDTH, WIDTH};
 
     #[test]
     fn every_open_hides_player_until_iris() {
-        for millis in [0., 15., 120., 240., 800., 1320., 1380.] {
-            assert!(Scene::new(Frame::at(millis)).content().is_none());
+        for width in [WIDTH as f32, COMPACT_WIDTH as f32] {
+            for millis in [0., 15., 120., 240., 800., 1320., 1380.] {
+                assert!(Scene::new(Frame::at(millis), width).content().is_none());
+            }
+            let (_, scale) = Scene::new(Frame::at(1450.), width).content().unwrap();
+            assert!((0.92..1.).contains(&scale));
+            let (tip, scale) = Scene::new(Frame::at(END_MS), width).content().unwrap();
+            assert_eq!((tip.0, scale), (width * 0.5, 1.));
         }
-        let (_, scale) = Scene::new(Frame::at(1450.)).content().unwrap();
-        assert!((0.92..1.).contains(&scale));
-        assert_eq!(
-            Scene::new(Frame::at(END_MS)).content(),
-            Some((TIP_SCREEN, 1.))
-        );
     }
 
     #[test]

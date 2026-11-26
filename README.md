@@ -8,9 +8,12 @@ The executable contains the Rust runtime, audio decoders, station catalog, and a
 
 ![Desktop Radio player in the graphite theme](docs/screenshots/player.png)
 
+![Compact player with the station list collapsed](docs/screenshots/compact.png)
+
 ## Features
 
 - Browse 268 stations from Belarus, Russia, Kazakhstan, and around the world. Search by name or frequency, save favorites, and control station order and visibility.
+- Use the station list button in the player toolbar to switch between the full and compact views. The player remembers your choice, and Ctrl+F opens the list and focuses search.
 - Play MP3, AAC, FLAC, and Ogg Vorbis radio streams. The player handles common HLS playlists and shows track metadata when a station publishes it.
 - Switch stations in the tray or with Windows media controls. Optionally resume the last station when the application starts.
 - Start Desktop Radio in the notification area when you sign in to Windows. This is enabled by default and can be disabled in Settings.
