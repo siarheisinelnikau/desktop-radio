@@ -2,7 +2,7 @@
 
 [Download the latest Windows release](https://github.com/siarheisinelnikau/desktop-radio/releases/latest)
 
-Desktop Radio is a portable internet radio for Windows 10 and 11 (x64). Run the single `DesktopRadio-v0.2.0.exe`, then click its icon in the notification area to open the player. Playback continues when you close the panel. Right-click the icon for playback controls, Settings, and Quit.
+Desktop Radio is a portable internet radio for Windows 10 and 11 (x64). Run the single `DesktopRadio-v0.3.0.exe`, then click its icon in the notification area to open the player. Playback continues when you close the panel. Right-click the icon for playback controls, Settings, and Quit.
 
 The executable contains the Rust runtime, audio decoders, station catalog, and application icon. It uses the APIs provided by Windows and runs without an installer, additional runtimes, or companion files.
 
@@ -38,7 +38,7 @@ Use Rust 1.96 or later with the Windows MSVC toolchain and Windows SDK.
 
 ```powershell
 cargo build --release --locked --target x86_64-pc-windows-msvc
-Copy-Item target/x86_64-pc-windows-msvc/release/DesktopRadio.exe DesktopRadio-v0.2.0.exe
+Copy-Item target/x86_64-pc-windows-msvc/release/DesktopRadio.exe DesktopRadio-v0.3.0.exe
 ```
 
 The application saves preferences in `%LOCALAPPDATA%\DesktopRadio\settings.json`. Updating the executable preserves that file.
