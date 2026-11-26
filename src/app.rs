@@ -1423,13 +1423,20 @@ impl App {
     }
 
     fn tune(&mut self, index: usize) {
-        if self.report.is_some() {
+        if self.current == Some(index) && self.is_active() {
             return;
         }
-        let station = &self.catalog.0[index];
+        let mut station = self.catalog.0[index].clone();
+        if let Some(report) = &self.report {
+            let Some((source, _)) = &report.meter_source else {
+                return;
+            };
+            station.streams = vec![source.clone()];
+            station.track_source_id = None;
+        }
         self.current = Some(index);
         self.prefs.station_id = Some(station.id.clone());
-        self.revision = self.engine.play(station.clone());
+        self.revision = self.engine.play(station);
         self.status = Status::Connecting;
         self.meter.reset();
         self.save_later();
@@ -1919,13 +1926,18 @@ impl App {
         }));
         let interval = match phase {
             0 => {
-                let mut station = self.catalog.0[self.current.unwrap_or_default()].clone();
-                station.streams = vec![diagnostic.meter_source.as_ref().unwrap().0.clone()];
-                station.track_source_id = None;
-                self.revision = self.engine.play(station);
+                self.tune(self.current.unwrap_or_default());
                 1500
             }
-            1 => 5200,
+            1 => {
+                let revision = self.revision;
+                self.perform(Action::Tune(self.current.unwrap()), 0., 0.);
+                if self.revision != revision || !matches!(self.status, Status::Playing(_)) {
+                    unsafe { PostQuitMessage(1) };
+                    return;
+                }
+                5200
+            }
             2 => {
                 self.hide();
                 1500
