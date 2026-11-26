@@ -31,8 +31,10 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{
-            DWMWA_CLOAK, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush,
-            DwmSetWindowAttribute,
+            DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CLOAK,
+            DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_ENABLED,
+            DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush,
+            DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -380,6 +382,7 @@ struct App {
     panel_resize: Option<PanelResize>,
     search_after_resize: bool,
     popup_extent: (i32, i32),
+    popup_clipped: bool,
     manage_group: &'static str,
     list: Vec<usize>,
     top: usize,
@@ -482,6 +485,7 @@ impl App {
             panel_resize: None,
             search_after_resize: false,
             popup_extent: (WIDTH, HEIGHT),
+            popup_clipped: false,
             manage_group: GROUPS[0],
             list: Vec::new(),
             top: 0,
@@ -924,24 +928,67 @@ impl App {
         (self.popup_extent.0 - self.pixel(self.popup_width())).max(0)
     }
 
-    fn apply_popup_region(&self) -> bool {
+    fn apply_popup_region(&mut self) -> bool {
         let (width, height) = self.popup_extent;
         let left = self.popup_left();
         let redraw = i32::from(self.visible);
         unsafe {
             if left == 0 {
-                return SetWindowRgn(self.window, null_mut(), redraw) != 0;
+                if self.popup_clipped {
+                    if SetWindowRgn(self.window, null_mut(), redraw) == 0 {
+                        return false;
+                    }
+                    self.set_clipped_frame(false);
+                    self.popup_clipped = false;
+                }
+                return true;
             }
             let diameter = self.pixel(16.).max(2);
             let region = CreateRoundRectRgn(left, 0, width + 1, height + 1, diameter, diameter);
             if region.is_null() {
                 return false;
             }
+            if !self.popup_clipped {
+                self.set_clipped_frame(true);
+            }
             if SetWindowRgn(self.window, region, redraw) != 0 {
+                self.popup_clipped = true;
                 return true;
             }
             DeleteObject(region);
+            if !self.popup_clipped {
+                self.set_clipped_frame(false);
+            }
             false
+        }
+    }
+
+    fn set_clipped_frame(&mut self, clipped: bool) {
+        let (policy, border) = if clipped {
+            (DWMNCRP_DISABLED, DWMWA_COLOR_NONE)
+        } else {
+            (DWMNCRP_USEWINDOWSTYLE, DWMWA_COLOR_DEFAULT)
+        };
+        let (policy_result, border_result) = unsafe {
+            // DWM can draw the frame around the whole HWND, outside its region.
+            let policy = DwmSetWindowAttribute(
+                self.window,
+                DWMWA_NCRENDERING_POLICY as u32,
+                (&raw const policy).cast(),
+                size_of_val(&policy) as u32,
+            );
+            let border = DwmSetWindowAttribute(
+                self.window,
+                DWMWA_BORDER_COLOR as u32,
+                (&raw const border).cast(),
+                size_of_val(&border) as u32,
+            );
+            (policy, border)
+        };
+        if let Some(report) = self.report.as_mut().filter(|report| report.measure_layout) {
+            report.layout_frame_updates.push(serde_json::json!({
+                "clipped": clipped, "policy_result": policy_result, "border_result": border_result,
+            }));
         }
     }
 
@@ -2192,6 +2239,16 @@ impl App {
             native_width
         };
         let expected_width = self.popup_extent.0 - self.popup_left();
+        let mut frame_rendering = 0;
+        let frame_rendering = unsafe {
+            let frame = DwmGetWindowAttribute(
+                self.window,
+                DWMWA_NCRENDERING_ENABLED as u32,
+                (&raw mut frame_rendering).cast(),
+                size_of_val(&frame_rendering) as u32,
+            );
+            (frame >= 0).then_some(frame_rendering != 0)
+        };
         let diagnostic = self.report.as_mut().unwrap();
         let phase = diagnostic.phase;
         diagnostic.phase += 1;
@@ -2203,6 +2260,7 @@ impl App {
             "visible": self.visible, "moving": self.panel_resize.is_some(),
             "search_visible": unsafe { IsWindowVisible(self.edit) } != 0,
             "search_hit": self.hits.iter().any(|hit| hit.action == Action::Search),
+            "frame_rendering": frame_rendering,
             "render": self.renders, "present": self.presents,
         }));
         let interval = match phase {
@@ -2235,6 +2293,7 @@ impl App {
                     "samples": diagnostic.samples, "present_ms": diagnostic.layout_frames,
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
                     "toolbar_checksums": diagnostic.layout_toolbar,
+                    "frame_updates": diagnostic.layout_frame_updates,
                 });
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
@@ -2583,6 +2642,7 @@ struct Diagnostics {
     measure_layout: bool,
     layout_frames: Vec<f64>,
     layout_toolbar: Vec<Option<String>>,
+    layout_frame_updates: Vec<serde_json::Value>,
 }
 
 impl Diagnostics {
@@ -2600,6 +2660,7 @@ impl Diagnostics {
             measure_layout: false,
             layout_frames: Vec::new(),
             layout_toolbar: Vec::new(),
+            layout_frame_updates: Vec::new(),
         }
     }
 }
