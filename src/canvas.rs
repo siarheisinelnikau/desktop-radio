@@ -145,47 +145,57 @@ impl Surface {
         unsafe { BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY) != 0 }
     }
 
-    pub fn matching_client_pixels(&self, dc: HDC, area: RECT) -> Option<String> {
+    pub fn set_layer_alpha(&mut self, width: i32, radius: i32, refresh_corners: bool) {
+        let radius = radius.min(width / 2).min(self.height / 2) as usize;
+        let width = width as usize;
+        let height = self.height as usize;
+        unsafe {
+            GdiFlush();
+            let pixels = std::slice::from_raw_parts_mut(
+                self.pixels.cast::<u32>(),
+                self.width as usize * height,
+            );
+            for (y, scanline) in pixels.chunks_exact_mut(self.width as usize).enumerate() {
+                let dy = y.min(height - 1 - y);
+                let inset = if dy < radius { radius } else { 0 };
+                for pixel in &mut scanline[inset..width - inset] {
+                    *pixel |= 0xff00_0000;
+                }
+                if refresh_corners && dy < radius {
+                    let dy = radius as f32 - dy as f32 - 0.5;
+                    for x in 0..radius {
+                        let dx = radius as f32 - x as f32 - 0.5;
+                        let coverage = (radius as f32 + 0.5 - dx.hypot(dy)).clamp(0., 1.);
+                        let alpha = (coverage * 255.).round() as u32;
+                        for index in [x, width - 1 - x] {
+                            let rgb = scanline[index];
+                            let premultiply = |shift: u32| {
+                                ((((rgb >> shift) & 255) * alpha + 127) / 255) << shift
+                            };
+                            scanline[index] =
+                                (alpha << 24) | premultiply(16) | premultiply(8) | premultiply(0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn rgb_checksum(&self, area: RECT) -> Option<String> {
         if area.left < 0 || area.top < 0 || area.right > self.width || area.bottom > self.height {
             return None;
         }
-        let width = area.right - area.left;
-        let strip = Self::new(width, area.bottom - area.top).ok()?;
         unsafe {
-            if BitBlt(
-                strip.dc,
-                0,
-                0,
-                width,
-                strip.height,
-                dc,
-                area.left,
-                area.top,
-                SRCCOPY,
-            ) == 0
-            {
-                return None;
-            }
             GdiFlush();
-            let seen = std::slice::from_raw_parts(
-                strip.pixels.cast::<u32>(),
-                (width * strip.height) as usize,
-            );
-            let expected = std::slice::from_raw_parts(
+            let pixels = std::slice::from_raw_parts(
                 self.pixels.cast::<u32>(),
                 (self.width * self.height) as usize,
             );
             let mut checksum = DefaultHasher::new();
-            for (row, pixels) in seen.chunks_exact(width as usize).enumerate() {
-                let offset = (area.top as usize + row) * self.width as usize + area.left as usize;
-                for (&expected, &actual) in
-                    expected[offset..offset + width as usize].iter().zip(pixels)
-                {
-                    let rgb = actual & 0x00ff_ffff;
-                    if expected & 0x00ff_ffff != rgb {
-                        return None;
-                    }
-                    rgb.hash(&mut checksum);
+            for row in area.top as usize..area.bottom as usize {
+                let offset = row * self.width as usize;
+                for &pixel in &pixels[offset + area.left as usize..offset + area.right as usize] {
+                    (pixel & 0x00ff_ffff).hash(&mut checksum);
                 }
             }
             Some(format!("{:016x}", checksum.finish()))
@@ -338,14 +348,6 @@ impl Canvas {
     pub fn clear(&self, color: Color) {
         unsafe {
             GdipGraphicsClear(self.graphics, color);
-        }
-    }
-
-    pub fn translate_x(&mut self, x: f32) {
-        if x != 0. {
-            unsafe {
-                GdipTranslateWorldTransform(self.graphics, x, 0., MatrixOrderPrepend);
-            }
         }
     }
 

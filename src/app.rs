@@ -31,10 +31,8 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::{
         Dwm::{
-            DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CLOAK,
-            DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
-            DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
-            DWMWCP_ROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
+            DWMWA_CLOAK, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+            DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -50,10 +48,12 @@ use windows_sys::Win32::{
 };
 
 const CLASS: &str = "DesktopRadio.TrayWindow";
+const COMPACT_CLASS: &str = "DesktopRadio.CompactWindow";
 const WAKE: u32 = WM_APP + 1;
 const TRAY: u32 = WM_APP + 2;
 const ACTIVATE: u32 = WM_APP + 3;
 const EDIT_KEY: u32 = WM_APP + 4;
+const LAYER_FRAME: u32 = WM_APP + 5;
 const METER_TIMER: usize = 1;
 const METER_FRAME_MS: u32 = 15;
 const INTRO_TIMER: usize = 2;
@@ -111,7 +111,7 @@ pub fn run() -> Result<()> {
             report.measure_layout = true;
             run_window(Some(report), false, false)
         }
-        ("--diagnose-meter", 4) => {
+        ("--diagnose-meter", 4..=5) => {
             let mode = unicode(&arguments[3])?;
             ensure!(
                 matches!(mode, "spectrum" | "waveform"),
@@ -122,6 +122,10 @@ pub fn run() -> Result<()> {
                 .map_err(|_| anyhow::anyhow!("Invalid audio test file path"))?;
             let mut report = Diagnostics::new(PathBuf::from(&arguments[1]));
             report.meter_source = Some((source.to_string(), mode.to_owned()));
+            if let Some(layout) = arguments.get(4) {
+                ensure!(unicode(layout)? == "compact", "Unknown diagnostic layout");
+                report.meter_compact = true;
+            }
             run_window(Some(report), false, false)
         }
         ("--cleanup-update" | "--update-failed", 2) => {
@@ -166,8 +170,8 @@ fn run_window(report: Option<Diagnostics>, update_failed: bool, autostart: bool)
         None
     };
     let diagnostic = report.is_some();
-    let window = create_window(diagnostic)?;
-    let mut app = App::new(window, report)?;
+    let (window, compact_window) = create_windows(diagnostic)?;
+    let mut app = App::new(window, compact_window, report)?;
     if autostart && !app.prefs.start_with_windows {
         return Ok(());
     }
@@ -294,7 +298,7 @@ impl Drop for InstanceGuard {
     }
 }
 
-fn create_window(diagnostic: bool) -> Result<HWND> {
+fn create_windows(diagnostic: bool) -> Result<(HWND, HWND)> {
     let instance = unsafe { GetModuleHandleW(null()) };
     let class = wide(if diagnostic {
         "DesktopRadio.DiagnosticWindow"
@@ -302,6 +306,11 @@ fn create_window(diagnostic: bool) -> Result<HWND> {
         CLASS
     });
     let title = wide("Desktop Radio");
+    let compact_class = wide(if diagnostic {
+        "DesktopRadio.DiagnosticCompactWindow"
+    } else {
+        COMPACT_CLASS
+    });
     unsafe {
         let icon = LoadImageW(instance, 1 as _, IMAGE_ICON, 32, 32, LR_SHARED) as HICON;
         let wc = WNDCLASSW {
@@ -315,6 +324,14 @@ fn create_window(diagnostic: bool) -> Result<HWND> {
         ensure!(
             RegisterClassW(&wc) != 0,
             "Register the Desktop Radio window"
+        );
+        let compact_wc = WNDCLASSW {
+            lpszClassName: compact_class.as_ptr(),
+            ..wc
+        };
+        ensure!(
+            RegisterClassW(&compact_wc) != 0,
+            "Register the compact Desktop Radio window"
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -338,7 +355,25 @@ fn create_window(diagnostic: bool) -> Result<HWND> {
             (&raw const corner).cast::<c_void>(),
             size_of_val(&corner) as u32,
         );
-        Ok(hwnd)
+        let compact = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
+            compact_class.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            COMPACT_WIDTH,
+            HEIGHT,
+            null_mut(),
+            null_mut(),
+            instance,
+            null(),
+        );
+        if compact.is_null() {
+            DestroyWindow(hwnd);
+            bail!("Create the compact Desktop Radio window");
+        }
+        Ok((hwnd, compact))
     }
 }
 
@@ -357,7 +392,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
     if message == WM_ERASEBKGND {
         return 1;
     }
-    if let Some(result) = with_app(|app| app.message(message, w, l)).flatten() {
+    if let Some(result) = with_app(|app| app.message(hwnd, message, w, l)).flatten() {
         return result;
     }
     DefWindowProcW(hwnd, message, w, l)
@@ -365,6 +400,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
 
 struct App {
     window: HWND,
+    compact_window: HWND,
+    active_popup: HWND,
+    layer_frame_pending: bool,
     edit: HWND,
     edit_font: HFONT,
     edit_brush: HBRUSH,
@@ -384,7 +422,6 @@ struct App {
     popup_extent: (i32, i32),
     popup_limit: (i32, i32),
     popup_anchor: POINT,
-    popup_clipped: bool,
     manage_group: &'static str,
     list: Vec<usize>,
     top: usize,
@@ -414,7 +451,7 @@ struct App {
 }
 
 impl App {
-    fn new(window: HWND, report: Option<Diagnostics>) -> Result<Self> {
+    fn new(window: HWND, compact_window: HWND, report: Option<Diagnostics>) -> Result<Self> {
         let diagnostic = report.is_some();
         let settings = data_dir().join("settings.json");
         let mut prefs = if diagnostic {
@@ -433,6 +470,7 @@ impl App {
             prefs.visualization = mode.clone();
             prefs.volume = 0;
         }
+        prefs.station_list_collapsed |= report.as_ref().is_some_and(|report| report.meter_compact);
         let current = prefs.station_id.as_deref().and_then(|id| catalog.get(id));
         let (sender, events) = mpsc::channel();
         let address = window as usize;
@@ -470,6 +508,9 @@ impl App {
         let player_width = player_width(prefs.station_list_collapsed);
         let mut app = Self {
             window,
+            compact_window,
+            active_popup: window,
+            layer_frame_pending: false,
             edit,
             edit_font: null_mut(),
             edit_brush: null_mut(),
@@ -489,7 +530,6 @@ impl App {
             popup_extent: (WIDTH, HEIGHT),
             popup_limit: (WIDTH, HEIGHT),
             popup_anchor: POINT::default(),
-            popup_clipped: false,
             manage_group: GROUPS[0],
             list: Vec::new(),
             top: 0,
@@ -523,7 +563,7 @@ impl App {
         Ok(app)
     }
 
-    fn message(&mut self, message: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
+    fn message(&mut self, hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> Option<LRESULT> {
         if self.report.is_some()
             && matches!(
                 message,
@@ -540,10 +580,28 @@ impl App {
         {
             return Some(0);
         }
+        if hwnd != self.active_popup
+            && matches!(
+                message,
+                WM_LBUTTONDOWN
+                    | WM_LBUTTONUP
+                    | WM_MOUSEMOVE
+                    | WM_MOUSELEAVE
+                    | WM_MOUSEWHEEL
+                    | WM_KEYDOWN
+                    | WM_CLOSE
+            )
+        {
+            return Some(0);
+        }
         let handled = match message {
             WM_NCHITTEST if self.report.is_some() => return Some(HTTRANSPARENT as LRESULT),
             WM_PAINT => {
-                self.paint();
+                if hwnd == self.window && self.active_popup == self.window {
+                    self.paint();
+                } else {
+                    unsafe { ValidateRect(hwnd, null()) };
+                }
                 true
             }
             WM_CLOSE => {
@@ -566,13 +624,25 @@ impl App {
                 self.receive();
                 true
             }
+            LAYER_FRAME => {
+                self.layer_frame_pending = false;
+                if self.visible
+                    && self.active_popup == self.compact_window
+                    && (self.dirty || self.meter_dirty)
+                {
+                    self.present_layered_popup(false);
+                }
+                true
+            }
             WM_TIMER => {
                 self.timer(w);
                 true
             }
             WM_SIZE => {
-                self.surface = None;
-                self.mark_dirty();
+                if hwnd == self.window && self.active_popup == self.window {
+                    self.surface = None;
+                    self.mark_dirty();
+                }
                 true
             }
             WM_DPICHANGED => {
@@ -616,7 +686,7 @@ impl App {
                     let mut tracking = TRACKMOUSEEVENT {
                         cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
-                        hwndTrack: self.window,
+                        hwndTrack: hwnd,
                         dwHoverTime: 0,
                     };
                     unsafe {
@@ -641,13 +711,13 @@ impl App {
                     self.focus = None;
                     if action != Action::Search {
                         unsafe {
-                            SetFocus(self.window);
+                            SetFocus(hwnd);
                         }
                     }
                     if action.is_slider() {
                         self.drag = Some(action);
                         unsafe {
-                            SetCapture(self.window);
+                            SetCapture(hwnd);
                         }
                     }
                     self.perform(action, x, y);
@@ -672,7 +742,7 @@ impl App {
                     y: ((l >> 16) as u16 as i16) as i32,
                 };
                 unsafe {
-                    ScreenToClient(self.window, &mut point);
+                    ScreenToClient(hwnd, &mut point);
                 }
                 let area = if self.page == Page::Stations {
                     MANAGE_LIST
@@ -680,10 +750,7 @@ impl App {
                     LIST
                 };
                 if self.can_scroll_stations()
-                    && area.contains(
-                        (point.x - self.popup_left()) as f32 / self.scale,
-                        point.y as f32 / self.scale,
-                    )
+                    && area.contains(point.x as f32 / self.scale, point.y as f32 / self.scale)
                 {
                     self.scroll(if ((w >> 16) as u16 as i16) > 0 { -3 } else { 3 });
                 }
@@ -749,12 +816,17 @@ impl App {
         if width <= 0 || height <= 0 {
             return false;
         }
+        let capacity = if self.panel_resize.is_some() {
+            self.popup_limit.0
+        } else {
+            width
+        };
         if self
             .surface
             .as_ref()
-            .is_none_or(|surface| surface.width != width || surface.height != height)
+            .is_none_or(|surface| surface.width != capacity || surface.height != height)
         {
-            self.surface = Surface::new(width, height).ok();
+            self.surface = Surface::new(capacity, height).ok();
             self.dirty = true;
         }
         let Some(surface) = &self.surface else {
@@ -764,7 +836,6 @@ impl App {
             let Ok(mut canvas) = Canvas::open(surface.dc, self.scale) else {
                 return false;
             };
-            canvas.translate_x(self.popup_left() as f32 / self.scale);
             if self.dirty {
                 self.hits = ui::render(&mut canvas, &self.view(true));
             } else {
@@ -793,6 +864,7 @@ impl App {
         &mut self,
         prepared: bool,
         background: COLORREF,
+        sample: bool,
     ) -> (bool, Option<bool>) {
         unsafe {
             let dc = GetDC(self.window);
@@ -814,13 +886,11 @@ impl App {
                 painted
             };
             GdiFlush();
-            let client_covered = self.report.is_some().then(|| {
+            let client_covered = (sample && self.report.is_some()).then(|| {
                 let mut area = RECT::default();
-                let left = self.popup_left();
                 GetClientRect(self.window, &mut area) != 0
-                    && GetPixel(dc, left + (area.right - left) / 4, area.bottom / 4) == background
-                    && GetPixel(dc, left + (area.right - left) * 3 / 4, area.bottom / 2)
-                        == background
+                    && GetPixel(dc, area.right / 4, area.bottom / 4) == background
+                    && GetPixel(dc, area.right * 3 / 4, area.bottom / 2) == background
             });
             ReleaseDC(self.window, dc);
             if presented {
@@ -833,7 +903,7 @@ impl App {
     fn view(&self, native_search: bool) -> View<'_> {
         View {
             page: self.page,
-            width: (self.popup_extent.0 - self.popup_left()) as f32 / self.scale,
+            width: self.popup_extent.0 as f32 / self.scale,
             station_list_ready: self.station_list_ready(),
             prefs: &self.prefs,
             catalog: &self.catalog,
@@ -861,10 +931,20 @@ impl App {
 
     fn mark_dirty(&mut self) {
         self.dirty = true;
-        if self.visible {
-            unsafe {
-                InvalidateRect(self.window, null(), 0);
+        self.queue_popup_frame(null());
+    }
+
+    fn queue_popup_frame(&mut self, bounds: *const RECT) {
+        if !self.visible {
+            return;
+        }
+        if self.active_popup == self.compact_window {
+            if !self.layer_frame_pending {
+                self.layer_frame_pending =
+                    unsafe { PostMessageW(self.window, LAYER_FRAME, 0, 0) } != 0;
             }
+        } else {
+            unsafe { InvalidateRect(self.window, bounds, 0) };
         }
     }
 
@@ -910,20 +990,7 @@ impl App {
                 x: work.right - margin,
                 y: work.bottom - margin,
             };
-            if self.position_popup(self.target_popup_extent()) {
-                self.apply_popup_region();
-            }
-        }
-    }
-
-    fn target_popup_extent(&self) -> (i32, i32) {
-        if self.panel_resize.is_some() {
-            self.popup_limit
-        } else {
-            (
-                self.pixel(self.popup_width()).min(self.popup_limit.0),
-                self.popup_limit.1,
-            )
+            self.position_popup(self.popup_limit);
         }
     }
 
@@ -959,130 +1026,164 @@ impl App {
         }
     }
 
-    fn popup_left(&self) -> i32 {
-        (self.popup_extent.0 - self.pixel(self.popup_width())).max(0)
+    fn uses_layered_popup(&self) -> bool {
+        self.page == Page::Player
+            && (self.panel_resize.is_some() || self.prefs.station_list_collapsed)
     }
 
-    fn apply_popup_region(&mut self) -> bool {
-        let (width, height) = self.popup_extent;
-        let left = self.popup_left();
-        let redraw = i32::from(self.visible);
+    fn choose_visible_popup(&mut self, popup: HWND) {
+        let previous = self.active_popup;
+        if previous == popup && unsafe { IsWindowVisible(popup) } != 0 {
+            return;
+        }
+        if self.drag.take().is_some() {
+            unsafe { ReleaseCapture() };
+        }
+        self.active_popup = popup;
+        let other = if popup == self.window {
+            self.compact_window
+        } else {
+            self.window
+        };
         unsafe {
-            if left == 0 {
-                if self.popup_clipped {
-                    if SetWindowRgn(self.window, null_mut(), redraw) == 0 {
-                        return false;
-                    }
-                    self.set_clipped_frame(false);
-                    self.popup_clipped = false;
-                }
-                return true;
+            let transfer_focus = self.report.is_none() && GetForegroundWindow() == previous;
+            SetWindowPos(
+                popup,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            ShowWindow(other, SW_HIDE);
+            if transfer_focus {
+                SetForegroundWindow(popup);
+                SetFocus(popup);
             }
-            let diameter = self.pixel(16.).max(2);
-            let region = CreateRoundRectRgn(left, 0, width + 1, height + 1, diameter, diameter);
-            if region.is_null() {
-                return false;
-            }
-            if !self.popup_clipped {
-                self.set_clipped_frame(true);
-            }
-            if SetWindowRgn(self.window, region, redraw) != 0 {
-                self.popup_clipped = true;
-                return true;
-            }
-            DeleteObject(region);
-            if !self.popup_clipped {
-                self.set_clipped_frame(false);
-            }
-            false
         }
     }
 
-    fn set_clipped_frame(&mut self, clipped: bool) {
-        let (policy, border) = if clipped {
-            (DWMNCRP_DISABLED, DWMWA_COLOR_NONE)
-        } else {
-            (DWMNCRP_USEWINDOWSTYLE, DWMWA_COLOR_DEFAULT)
+    fn present_layered_popup(&mut self, measure: bool) -> bool {
+        let (max_width, height) = self.popup_limit;
+        let width = self.pixel(self.popup_width()).min(max_width);
+        self.popup_extent = (width, height);
+        let refresh_corners = self.dirty
+            || self.surface.as_ref().is_none_or(|surface| {
+                let capacity = if self.panel_resize.is_some() {
+                    max_width
+                } else {
+                    width
+                };
+                surface.width != capacity || surface.height != height
+            });
+        let meter_only = self.meter_dirty && !refresh_corners;
+        if !self.render_surface(width, height) {
+            return false;
+        }
+        let radius = self.pixel(8.).max(1);
+        let surface = self.surface.as_mut().unwrap();
+        surface.set_layer_alpha(width, radius, refresh_corners);
+        let origin = POINT {
+            x: self.popup_anchor.x - width,
+            y: self.popup_anchor.y - height,
         };
-        let (policy_result, border_result) = unsafe {
-            // DWM can draw the frame around the whole HWND, outside its region.
-            let policy = DwmSetWindowAttribute(
-                self.window,
-                DWMWA_NCRENDERING_POLICY as u32,
-                (&raw const policy).cast(),
-                size_of_val(&policy) as u32,
-            );
-            let border = DwmSetWindowAttribute(
-                self.window,
-                DWMWA_BORDER_COLOR as u32,
-                (&raw const border).cast(),
-                size_of_val(&border) as u32,
-            );
-            (policy, border)
+        let size = SIZE {
+            cx: width,
+            cy: height,
         };
-        if let Some(report) = self.report.as_mut().filter(|report| report.measure_layout) {
-            report.layout_frame_updates.push(serde_json::json!({
-                "clipped": clipped, "policy_result": policy_result, "border_result": border_result,
-            }));
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        if unsafe {
+            UpdateLayeredWindow(
+                self.compact_window,
+                null_mut(),
+                &origin,
+                &size,
+                surface.dc,
+                &POINT::default(),
+                0,
+                &blend,
+                ULW_ALPHA,
+            )
+        } == 0
+        {
+            self.dirty = true;
+            return false;
+        }
+        self.presents += 1;
+        self.choose_visible_popup(self.compact_window);
+        self.record_popup_frame(measure, meter_only);
+        true
+    }
+
+    fn record_popup_frame(&mut self, measure: bool, meter_only: bool) {
+        let Some(report) = &mut self.report else {
+            return;
+        };
+        let now = report.start.elapsed().as_secs_f64() * 1000.;
+        if meter_only {
+            report.meter_presents.push(now);
+        }
+        if measure && report.measure_layout {
+            let scale = self.scale;
+            let pixel = |value: f32| (value * scale).round() as i32;
+            let width = self.popup_extent.0;
+            let toolbar = RECT {
+                left: width - pixel(212.),
+                right: width - pixel(18.),
+                top: pixel(14.),
+                bottom: pixel(61.),
+            };
+            report.layout_frames.push(now);
+            report.layout_toolbar.push(
+                self.surface
+                    .as_ref()
+                    .and_then(|surface| surface.rgb_checksum(toolbar)),
+            );
         }
     }
 
     fn present_panel_resize(&mut self) {
-        // Use the full backing only during the transition. At rest the native
-        // bounds also match the visible player, including its system frame.
-        let previous = self.popup_extent;
-        let (width, height) = self.target_popup_extent();
-        let reposition = previous != (width, height);
-        self.popup_extent = (width, height);
         self.dirty = true;
-        let prepared = self.render_surface(width, height);
-        let cloaked = reposition && self.set_cloak(true);
-        let positioned = !reposition || self.position_popup((width, height));
-        if !positioned {
-            self.popup_extent = previous;
-        }
-        let mut presented_frame = false;
-        if positioned && self.apply_popup_region() && prepared {
-            unsafe {
-                let dc = GetDC(self.window);
-                if !dc.is_null() {
-                    let surface = self.surface.as_ref().unwrap();
-                    let presented = surface.blit(dc);
-                    GdiFlush();
-                    let toolbar = RECT {
-                        left: width - self.pixel(212.),
-                        right: width - self.pixel(18.),
-                        top: self.pixel(14.),
-                        bottom: self.pixel(61.),
-                    };
-                    if let Some(report) =
-                        self.report.as_mut().filter(|report| report.measure_layout)
-                    {
-                        report
-                            .layout_frames
-                            .push(report.start.elapsed().as_secs_f64() * 1000.);
-                        report.layout_toolbar.push(
-                            presented
-                                .then(|| surface.matching_client_pixels(dc, toolbar))
-                                .flatten(),
-                        );
-                    }
-                    ReleaseDC(self.window, dc);
-                    if presented {
-                        self.presents += 1;
-                        ValidateRect(self.window, null());
-                        presented_frame = true;
-                    }
-                }
+        if self.uses_layered_popup() {
+            if !self.present_layered_popup(true) {
+                self.prefs.station_list_collapsed = false;
+                self.reset_panel_resize();
+                self.present_full_popup();
+                self.show_edit();
             }
+        } else {
+            self.present_full_popup();
         }
+    }
+
+    fn present_full_popup(&mut self) {
+        self.popup_extent = self.popup_limit;
+        let (width, height) = self.popup_limit;
+        let prepared = self.render_surface(width, height);
+        let switching = self.active_popup != self.window;
+        let cloaked = switching && self.set_cloak(true);
+        if switching {
+            unsafe { ShowWindow(self.window, SW_SHOWNOACTIVATE) };
+        }
+        let background = color_ref(Palette::for_theme(&self.prefs.theme).window);
+        let (presented, _) = self.present_opening_cover(prepared, background, false);
         if cloaked {
-            if presented_frame {
+            if presented {
                 unsafe { DwmFlush() };
             }
             self.set_cloak(false);
         }
-        if !presented_frame {
+        self.choose_visible_popup(self.window);
+        if prepared && presented {
+            unsafe { ValidateRect(self.window, null()) };
+            self.record_popup_frame(true, false);
+        } else {
             self.mark_dirty();
         }
     }
@@ -1091,25 +1192,48 @@ impl App {
         if self.visible {
             if self.report.is_none() {
                 unsafe {
-                    SetForegroundWindow(self.window);
+                    SetForegroundWindow(self.active_popup);
                 }
             }
             return;
         }
         self.place();
-        let play_intro = intro
+        let animate = intro
             && self.page == Page::Player
             && self.prefs.show_intro
-            && (self.report.is_some() || client_animations_enabled())
-            && self.set_cloak(true);
-        let background = color_ref(Palette::for_theme(&self.prefs.theme).window);
-        self.dirty = true;
-        if play_intro {
-            self.intro = Some(Animation::new(Instant::now()));
-            if let Some(report) = &mut self.report {
-                report.intro_start = Some((cpu_milliseconds(), self.renders));
+            && (self.report.is_some() || client_animations_enabled());
+        if self.uses_layered_popup() {
+            self.visible = true;
+            self.start_opening_frame(animate);
+            if self.present_layered_popup(false) {
+                if animate {
+                    if let Some(report) = &mut self.report {
+                        report.opening_frames.push(serde_json::json!({
+                            "layered": true, "presented": true,
+                            "full_window_visible": unsafe { IsWindowVisible(self.window) } != 0,
+                            "edit_visible": unsafe { IsWindowVisible(self.edit) } != 0,
+                        }));
+                    }
+                    self.run_intro_timer();
+                }
+                if self.report.is_none() {
+                    unsafe {
+                        SetForegroundWindow(self.compact_window);
+                        SetFocus(self.compact_window);
+                    }
+                }
+                self.meter_schedule();
+                return;
             }
+            self.visible = false;
+            self.intro = None;
+            self.prefs.station_list_collapsed = false;
+            self.reset_panel_resize();
         }
+        self.active_popup = self.window;
+        let play_intro = animate && self.set_cloak(true);
+        let background = color_ref(Palette::for_theme(&self.prefs.theme).window);
+        self.start_opening_frame(play_intro);
         let prepared = play_intro && self.render_client();
         // A hidden tray window can still have its previous pixels in the compositor.
         // Keep it cloaked until the covered frame has reached the window DC.
@@ -1126,7 +1250,8 @@ impl App {
             );
         }
         if play_intro {
-            let (presented, client_covered) = self.present_opening_cover(prepared, background);
+            let (presented, client_covered) =
+                self.present_opening_cover(prepared, background, true);
             let compositor_ready = presented && unsafe { DwmFlush() } >= 0;
             let uncloaked = self.set_cloak(false);
             if let Some(report) = &mut self.report {
@@ -1148,13 +1273,10 @@ impl App {
                     "edit_visible": unsafe { IsWindowVisible(self.edit) } != 0,
                 }));
             }
-            self.intro = Some(Animation::new(Instant::now()));
             if !presented {
                 self.mark_dirty();
             }
-            if unsafe { SetTimer(self.window, INTRO_TIMER, FRAME_MS, None) } == 0 {
-                self.end_intro();
-            }
+            self.run_intro_timer();
         }
         if self.report.is_none() {
             unsafe {
@@ -1165,6 +1287,23 @@ impl App {
         self.meter_schedule();
         if !prepared {
             self.mark_dirty();
+        }
+    }
+
+    fn start_opening_frame(&mut self, animate: bool) {
+        self.dirty = true;
+        if animate {
+            self.intro = Some(Animation::new(Instant::now()));
+            if let Some(report) = &mut self.report {
+                report.intro_start = Some((cpu_milliseconds(), self.renders));
+            }
+        }
+    }
+
+    fn run_intro_timer(&mut self) {
+        self.intro = Some(Animation::new(Instant::now()));
+        if unsafe { SetTimer(self.window, INTRO_TIMER, FRAME_MS, None) } == 0 {
+            self.end_intro();
         }
     }
 
@@ -1191,6 +1330,7 @@ impl App {
             KillTimer(self.window, METER_TIMER);
             KillTimer(self.window, INTRO_TIMER);
             ShowWindow(self.window, SW_HIDE);
+            ShowWindow(self.compact_window, SW_HIDE);
         }
     }
 
@@ -1256,7 +1396,7 @@ impl App {
 
     fn logical(&self, value: LPARAM) -> (f32, f32) {
         (
-            ((value as u16 as i16) as i32 - self.popup_left()) as f32 / self.scale,
+            (value as u16 as i16) as f32 / self.scale,
             ((value >> 16) as u16 as i16) as f32 / self.scale,
         )
     }
@@ -1282,7 +1422,7 @@ impl App {
         self.focus = None;
         self.top = 0;
         self.relist(page == Page::Player);
-        if self.visible && (self.popup_clipped || self.target_popup_extent() != self.popup_extent) {
+        if self.visible && self.uses_layered_popup() != (self.active_popup == self.compact_window) {
             self.present_panel_resize();
         }
         self.show_edit();
@@ -1318,7 +1458,7 @@ impl App {
         if collapsed {
             self.search_after_resize = false;
             if unsafe { GetFocus() == self.edit } {
-                unsafe { SetFocus(self.window) };
+                unsafe { SetFocus(self.active_popup) };
             }
         }
         let target = player_width(collapsed);
@@ -1333,13 +1473,9 @@ impl App {
                 started: Instant::now(),
             });
             self.show_edit();
-            if self.target_popup_extent() != self.popup_extent {
-                self.present_panel_resize();
-                if let Some(resize) = &mut self.panel_resize {
-                    resize.started = Instant::now();
-                }
-            } else {
-                self.mark_dirty();
+            self.present_panel_resize();
+            if let Some(resize) = &mut self.panel_resize {
+                resize.started = Instant::now();
             }
         } else {
             self.complete_panel_resize();
@@ -1628,7 +1764,7 @@ impl App {
                     SetFocus(if action == Action::Search {
                         self.edit
                     } else {
-                        self.window
+                        self.active_popup
                     });
                 }
                 self.mark_dirty();
@@ -1638,7 +1774,7 @@ impl App {
                     self.tune(*index);
                 }
                 unsafe {
-                    SetFocus(self.window);
+                    SetFocus(self.active_popup);
                 }
             }
             VK_RETURN | VK_SPACE if !from_edit => {
@@ -1956,16 +2092,13 @@ impl App {
                     self.meter_dirty = true;
                     let area = ui::METER_REDRAW;
                     let scale = self.scale;
-                    let left = self.popup_left();
                     let bounds = RECT {
-                        left: left + (area.x * scale).floor() as i32,
+                        left: (area.x * scale).floor() as i32,
                         top: (area.y * scale).floor() as i32,
-                        right: left + (area.right() * scale).ceil() as i32,
+                        right: (area.right() * scale).ceil() as i32,
                         bottom: (area.bottom() * scale).ceil() as i32,
                     };
-                    unsafe {
-                        InvalidateRect(self.window, &bounds, 0);
-                    }
+                    self.queue_popup_frame(&bounds);
                 }
             }
             INTRO_TIMER => {
@@ -2086,6 +2219,11 @@ impl App {
             return;
         }
         let mut point = POINT::default();
+        let owner = if self.visible {
+            self.active_popup
+        } else {
+            self.window
+        };
         unsafe {
             for (id, title) in items {
                 AppendMenuW(
@@ -2096,18 +2234,18 @@ impl App {
                 );
             }
             GetCursorPos(&mut point);
-            SetForegroundWindow(self.window);
+            SetForegroundWindow(owner);
             let action = TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
                 point.x,
                 point.y,
                 0,
-                self.window,
+                owner,
                 null(),
             );
             DestroyMenu(menu);
-            PostMessageW(self.window, WM_NULL, 0, 0);
+            PostMessageW(owner, WM_NULL, 0, 0);
             if action != 6 {
                 self.receive();
             }
@@ -2156,7 +2294,7 @@ impl App {
             return;
         };
         let phase = diagnostic.phase;
-        let visible = unsafe { IsWindowVisible(self.window) } != 0;
+        let visible = unsafe { IsWindowVisible(self.active_popup) } != 0;
         let state = [
             "visible start",
             "visible end",
@@ -2241,6 +2379,8 @@ impl App {
             "ms": diagnostic.start.elapsed().as_secs_f64() * 1000.,
             "cpu_ms": cpu_milliseconds(), "render": self.renders, "present": self.presents,
             "visible": self.visible, "playing": matches!(self.status, Status::Playing(_)),
+            "full_visible": unsafe { IsWindowVisible(self.window) } != 0,
+            "compact_visible": unsafe { IsWindowVisible(self.compact_window) } != 0,
             "meter_presents": diagnostic.meter_presents.len(),
         }));
         let interval = match phase {
@@ -2288,48 +2428,33 @@ impl App {
 
     fn diagnose_layout(&mut self) {
         let mut rect = RECT::default();
-        let native_width = (unsafe { GetWindowRect(self.window, &mut rect) } != 0)
-            .then_some(rect.right - rect.left);
-        let mut region = RECT::default();
-        let has_region = unsafe { GetWindowRgnBox(self.window, &mut region) } != 0;
-        let width = if has_region {
-            Some(region.right - region.left)
-        } else {
-            native_width
-        };
-        let expected_width = self.popup_extent.0 - self.popup_left();
+        let hwnd = self.active_popup;
+        let native_width =
+            (unsafe { GetWindowRect(hwnd, &mut rect) } != 0).then_some(rect.right - rect.left);
         let mut frame = RECT::default();
         let frame_width = (unsafe {
             DwmGetWindowAttribute(
-                self.window,
+                hwnd,
                 DWMWA_EXTENDED_FRAME_BOUNDS as u32,
                 (&raw mut frame).cast(),
                 size_of_val(&frame) as u32,
             )
         } >= 0)
             .then_some(frame.right - frame.left);
-        let mut frame_rendering = 0;
-        let frame_rendering = unsafe {
-            let frame = DwmGetWindowAttribute(
-                self.window,
-                DWMWA_NCRENDERING_ENABLED as u32,
-                (&raw mut frame_rendering).cast(),
-                size_of_val(&frame_rendering) as u32,
-            );
-            (frame >= 0).then_some(frame_rendering != 0)
-        };
         let diagnostic = self.report.as_mut().unwrap();
         let phase = diagnostic.phase;
         diagnostic.phase += 1;
         diagnostic.samples.push(serde_json::json!({
             "ms": diagnostic.start.elapsed().as_secs_f64() * 1000.,
-            "cpu_ms": cpu_milliseconds(), "expected_width": expected_width,
-            "width": width, "native_width": native_width, "frame_width": frame_width, "right": rect.right,
+            "cpu_ms": cpu_milliseconds(), "expected_width": self.popup_extent.0,
+            "native_width": native_width, "frame_width": frame_width, "right": rect.right,
             "page": format!("{:?}", self.page),
             "visible": self.visible, "moving": self.panel_resize.is_some(),
+            "full_visible": unsafe { IsWindowVisible(self.window) } != 0,
+            "compact_visible": unsafe { IsWindowVisible(self.compact_window) } != 0,
+            "layered": unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED } != 0,
             "search_visible": unsafe { IsWindowVisible(self.edit) } != 0,
             "search_hit": self.hits.iter().any(|hit| hit.action == Action::Search),
-            "frame_rendering": frame_rendering,
             "render": self.renders, "present": self.presents,
         }));
         let interval = match phase {
@@ -2362,7 +2487,6 @@ impl App {
                     "samples": diagnostic.samples, "present_ms": diagnostic.layout_frames,
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
                     "toolbar_checksums": diagnostic.layout_toolbar,
-                    "frame_updates": diagnostic.layout_frame_updates,
                     "native_positions": diagnostic.layout_positions,
                 });
                 let saved =
@@ -2387,6 +2511,7 @@ impl Drop for App {
         self.media.take();
         unsafe {
             DestroyWindow(self.window);
+            DestroyWindow(self.compact_window);
             if !self.edit_brush.is_null() {
                 DeleteObject(self.edit_brush);
             }
@@ -2708,11 +2833,11 @@ struct Diagnostics {
     intros: Vec<serde_json::Value>,
     opening_frames: Vec<serde_json::Value>,
     meter_source: Option<(String, String)>,
+    meter_compact: bool,
     meter_presents: Vec<f64>,
     measure_layout: bool,
     layout_frames: Vec<f64>,
     layout_toolbar: Vec<Option<String>>,
-    layout_frame_updates: Vec<serde_json::Value>,
     layout_positions: Vec<(f64, i32)>,
 }
 
@@ -2727,11 +2852,11 @@ impl Diagnostics {
             intros: Vec::new(),
             opening_frames: Vec::new(),
             meter_source: None,
+            meter_compact: false,
             meter_presents: Vec::new(),
             measure_layout: false,
             layout_frames: Vec::new(),
             layout_toolbar: Vec::new(),
-            layout_frame_updates: Vec::new(),
             layout_positions: Vec::new(),
         }
     }
