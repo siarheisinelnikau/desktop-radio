@@ -1224,7 +1224,7 @@ impl Draw<'_, '_> {
             Icon::StationList(collapsed) => {
                 c.panel(A::new(x - 8., y - 6., 16., 12.), 2., 0, Some(color));
                 line((-2.5, -5.5), (-2.5, 5.5));
-                let dir = if collapsed { 1. } else { -1. };
+                let dir = if collapsed { -1. } else { 1. };
                 line((2.6 - 1.5 * dir, -2.1), (2.6 + 1.5 * dir, 0.));
                 line((2.6 - 1.5 * dir, 2.1), (2.6 + 1.5 * dir, 0.));
             }

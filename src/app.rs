@@ -714,13 +714,6 @@ impl App {
                     .is_some_and(|surface| surface.blit(dc))
             {
                 self.presents += 1;
-                if let Some(report) = self.report.as_mut().filter(|report| report.measure_layout)
-                    && self.panel_resize.is_some()
-                {
-                    report
-                        .layout_frames
-                        .push(report.start.elapsed().as_secs_f64() * 1000.);
-                }
                 if meter_only {
                     if let Some(report) = &mut self.report {
                         report
@@ -738,7 +731,10 @@ impl App {
         if unsafe { GetClientRect(self.window, &mut rectangle) } == 0 {
             return false;
         }
-        let (width, height) = (rectangle.right, rectangle.bottom);
+        self.render_surface(rectangle.right, rectangle.bottom)
+    }
+
+    fn render_surface(&mut self, width: i32, height: i32) -> bool {
         if width <= 0 || height <= 0 {
             return false;
         }
@@ -909,13 +905,21 @@ impl App {
         }
     }
 
-    fn resize_popup(&self) {
+    fn popup_size(&self) -> (i32, i32) {
+        (
+            self.pixel(self.popup_width())
+                .min(self.work_area.right - self.work_area.left),
+            self.pixel(HEIGHT as f32)
+                .min(self.work_area.bottom - self.work_area.top),
+        )
+    }
+
+    fn resize_popup(&self) -> bool {
         let work = self.work_area;
-        if work.right <= work.left || work.bottom <= work.top {
-            return;
+        let (width, height) = self.popup_size();
+        if width <= 0 || height <= 0 {
+            return false;
         }
-        let width = self.pixel(self.popup_width()).min(work.right - work.left);
-        let height = self.pixel(HEIGHT as f32).min(work.bottom - work.top);
         let margin = self.pixel(10.);
         unsafe {
             SetWindowPos(
@@ -925,9 +929,48 @@ impl App {
                 work.bottom - height - margin,
                 width,
                 height,
-                SWP_NOACTIVATE,
-            );
+                SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            ) != 0
         }
+    }
+
+    fn present_panel_resize(&mut self) {
+        // Draw the new toolbar before Windows changes the window bounds. Commit it
+        // immediately after the resize, before returning to the message queue.
+        self.dirty = true;
+        let (width, height) = self.popup_size();
+        let prepared = self.render_surface(width, height);
+        if self.resize_popup() && prepared {
+            unsafe {
+                let dc = GetDC(self.window);
+                if !dc.is_null() {
+                    let surface = self.surface.as_ref().unwrap();
+                    let presented = surface.blit(dc);
+                    GdiFlush();
+                    let toolbar_top = self.pixel(14.);
+                    let toolbar_bottom = self.pixel(61.);
+                    if let Some(report) =
+                        self.report.as_mut().filter(|report| report.measure_layout)
+                    {
+                        report
+                            .layout_frames
+                            .push(report.start.elapsed().as_secs_f64() * 1000.);
+                        if !presented
+                            || !surface.matches_strip(dc, width, toolbar_top, toolbar_bottom)
+                        {
+                            report.layout_toolbar_mismatches += 1;
+                        }
+                    }
+                    ReleaseDC(self.window, dc);
+                    if presented {
+                        self.presents += 1;
+                        ValidateRect(self.window, null());
+                        return;
+                    }
+                }
+            }
+        }
+        self.mark_dirty();
     }
 
     fn show(&mut self, intro: bool) {
@@ -1193,13 +1236,14 @@ impl App {
         let focus_search = self.search_after_resize;
         self.reset_panel_resize();
         if self.visible {
-            self.resize_popup();
+            self.present_panel_resize();
             self.show_edit();
             if focus_search {
                 self.focus_search();
             }
+        } else {
+            self.mark_dirty();
         }
-        self.mark_dirty();
     }
 
     fn focus_search(&mut self) {
@@ -1821,8 +1865,7 @@ impl App {
                         self.complete_panel_resize();
                     } else if self.pixel(width) != self.pixel(self.player_width) {
                         self.player_width = width;
-                        self.resize_popup();
-                        self.mark_dirty();
+                        self.present_panel_resize();
                     }
                 }
             }
@@ -2167,6 +2210,7 @@ impl App {
                 let result = serde_json::json!({
                     "samples": diagnostic.samples, "present_ms": diagnostic.layout_frames,
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
+                    "toolbar_mismatches": diagnostic.layout_toolbar_mismatches,
                 });
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
@@ -2514,6 +2558,7 @@ struct Diagnostics {
     meter_presents: Vec<f64>,
     measure_layout: bool,
     layout_frames: Vec<f64>,
+    layout_toolbar_mismatches: usize,
 }
 
 impl Diagnostics {
@@ -2530,6 +2575,7 @@ impl Diagnostics {
             meter_presents: Vec::new(),
             measure_layout: false,
             layout_frames: Vec::new(),
+            layout_toolbar_mismatches: 0,
         }
     }
 }

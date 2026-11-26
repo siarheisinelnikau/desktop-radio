@@ -136,6 +136,38 @@ impl Surface {
         unsafe { BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY) != 0 }
     }
 
+    pub fn matches_strip(&self, dc: HDC, width: i32, top: i32, bottom: i32) -> bool {
+        if top < 0 || bottom > self.height || width > self.width {
+            return false;
+        }
+        let Ok(strip) = Self::new(width, bottom - top) else {
+            return false;
+        };
+        unsafe {
+            if BitBlt(strip.dc, 0, 0, width, strip.height, dc, 0, top, SRCCOPY) == 0 {
+                return false;
+            }
+            GdiFlush();
+            let seen = std::slice::from_raw_parts(
+                strip.pixels.cast::<u32>(),
+                (width * strip.height) as usize,
+            );
+            let expected = std::slice::from_raw_parts(
+                self.pixels.cast::<u32>(),
+                (self.width * self.height) as usize,
+            );
+            seen.chunks_exact(width as usize)
+                .enumerate()
+                .all(|(row, actual)| {
+                    let offset = (top as usize + row) * self.width as usize;
+                    expected[offset..offset + width as usize]
+                        .iter()
+                        .zip(actual)
+                        .all(|(expected, actual)| (expected ^ actual) & 0x00ff_ffff == 0)
+                })
+        }
+    }
+
     pub fn png(&self, path: &Path) -> Result<()> {
         unsafe {
             GdiFlush();
