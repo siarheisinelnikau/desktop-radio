@@ -32,9 +32,9 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{
             DWMNCRP_DISABLED, DWMNCRP_USEWINDOWSTYLE, DWMWA_BORDER_COLOR, DWMWA_CLOAK,
-            DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_NCRENDERING_ENABLED,
-            DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmFlush,
-            DwmGetWindowAttribute, DwmSetWindowAttribute,
+            DWMWA_COLOR_DEFAULT, DWMWA_COLOR_NONE, DWMWA_EXTENDED_FRAME_BOUNDS,
+            DWMWA_NCRENDERING_ENABLED, DWMWA_NCRENDERING_POLICY, DWMWA_WINDOW_CORNER_PREFERENCE,
+            DWMWCP_ROUND, DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute,
         },
         Gdi::*,
     },
@@ -382,6 +382,8 @@ struct App {
     panel_resize: Option<PanelResize>,
     search_after_resize: bool,
     popup_extent: (i32, i32),
+    popup_limit: (i32, i32),
+    popup_anchor: POINT,
     popup_clipped: bool,
     manage_group: &'static str,
     list: Vec<usize>,
@@ -485,6 +487,8 @@ impl App {
             panel_resize: None,
             search_after_resize: false,
             popup_extent: (WIDTH, HEIGHT),
+            popup_limit: (WIDTH, HEIGHT),
+            popup_anchor: POINT::default(),
             popup_clipped: false,
             manage_group: GROUPS[0],
             list: Vec::new(),
@@ -897,23 +901,54 @@ impl App {
                 self.update_edit();
                 self.surface = None;
             }
-            let width = self.pixel(WIDTH as f32).min(width);
-            let height = self.pixel(HEIGHT as f32).min(height);
             let margin = self.pixel(10.);
-            if SetWindowPos(
-                self.window,
-                HWND_TOPMOST,
-                work.right - width - margin,
-                work.bottom - height - margin,
-                width,
-                height,
-                SWP_NOACTIVATE,
-            ) != 0
-            {
-                self.popup_extent = (width, height);
+            self.popup_limit = (
+                self.pixel(WIDTH as f32).min(width),
+                self.pixel(HEIGHT as f32).min(height),
+            );
+            self.popup_anchor = POINT {
+                x: work.right - margin,
+                y: work.bottom - margin,
+            };
+            if self.position_popup(self.target_popup_extent()) {
                 self.apply_popup_region();
             }
         }
+    }
+
+    fn target_popup_extent(&self) -> (i32, i32) {
+        if self.panel_resize.is_some() {
+            self.popup_limit
+        } else {
+            (
+                self.pixel(self.popup_width()).min(self.popup_limit.0),
+                self.popup_limit.1,
+            )
+        }
+    }
+
+    fn position_popup(&mut self, (width, height): (i32, i32)) -> bool {
+        if unsafe {
+            SetWindowPos(
+                self.window,
+                HWND_TOPMOST,
+                self.popup_anchor.x - width,
+                self.popup_anchor.y - height,
+                width,
+                height,
+                SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            )
+        } == 0
+        {
+            return false;
+        }
+        self.popup_extent = (width, height);
+        if let Some(report) = self.report.as_mut().filter(|report| report.measure_layout) {
+            report
+                .layout_positions
+                .push((report.start.elapsed().as_secs_f64() * 1000., width));
+        }
+        true
     }
 
     fn popup_width(&self) -> f32 {
@@ -993,12 +1028,21 @@ impl App {
     }
 
     fn present_panel_resize(&mut self) {
-        // Keep the native window and backing bitmap at their full size so DWM
-        // never has to stretch the toolbar while changing the visible width.
+        // Use the full backing only during the transition. At rest the native
+        // bounds also match the visible player, including its system frame.
+        let previous = self.popup_extent;
+        let (width, height) = self.target_popup_extent();
+        let reposition = previous != (width, height);
+        self.popup_extent = (width, height);
         self.dirty = true;
-        let (width, height) = self.popup_extent;
         let prepared = self.render_surface(width, height);
-        if self.apply_popup_region() && prepared {
+        let cloaked = reposition && self.set_cloak(true);
+        let positioned = !reposition || self.position_popup((width, height));
+        if !positioned {
+            self.popup_extent = previous;
+        }
+        let mut presented_frame = false;
+        if positioned && self.apply_popup_region() && prepared {
             unsafe {
                 let dc = GetDC(self.window);
                 if !dc.is_null() {
@@ -1027,12 +1071,20 @@ impl App {
                     if presented {
                         self.presents += 1;
                         ValidateRect(self.window, null());
-                        return;
+                        presented_frame = true;
                     }
                 }
             }
         }
-        self.mark_dirty();
+        if cloaked {
+            if presented_frame {
+                unsafe { DwmFlush() };
+            }
+            self.set_cloak(false);
+        }
+        if !presented_frame {
+            self.mark_dirty();
+        }
     }
 
     fn show(&mut self, intro: bool) {
@@ -1223,9 +1275,6 @@ impl App {
         }
         self.page = page;
         self.reset_panel_resize();
-        if self.visible {
-            self.apply_popup_region();
-        }
         if self.intro.is_some() {
             self.end_intro();
         }
@@ -1233,6 +1282,9 @@ impl App {
         self.focus = None;
         self.top = 0;
         self.relist(page == Page::Player);
+        if self.visible && (self.popup_clipped || self.target_popup_extent() != self.popup_extent) {
+            self.present_panel_resize();
+        }
         self.show_edit();
         self.meter_schedule();
         self.mark_dirty();
@@ -1281,7 +1333,14 @@ impl App {
                 started: Instant::now(),
             });
             self.show_edit();
-            self.mark_dirty();
+            if self.target_popup_extent() != self.popup_extent {
+                self.present_panel_resize();
+                if let Some(resize) = &mut self.panel_resize {
+                    resize.started = Instant::now();
+                }
+            } else {
+                self.mark_dirty();
+            }
         } else {
             self.complete_panel_resize();
         }
@@ -2239,6 +2298,16 @@ impl App {
             native_width
         };
         let expected_width = self.popup_extent.0 - self.popup_left();
+        let mut frame = RECT::default();
+        let frame_width = (unsafe {
+            DwmGetWindowAttribute(
+                self.window,
+                DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+                (&raw mut frame).cast(),
+                size_of_val(&frame) as u32,
+            )
+        } >= 0)
+            .then_some(frame.right - frame.left);
         let mut frame_rendering = 0;
         let frame_rendering = unsafe {
             let frame = DwmGetWindowAttribute(
@@ -2255,7 +2324,7 @@ impl App {
         diagnostic.samples.push(serde_json::json!({
             "ms": diagnostic.start.elapsed().as_secs_f64() * 1000.,
             "cpu_ms": cpu_milliseconds(), "expected_width": expected_width,
-            "width": width, "native_width": native_width, "right": rect.right,
+            "width": width, "native_width": native_width, "frame_width": frame_width, "right": rect.right,
             "page": format!("{:?}", self.page),
             "visible": self.visible, "moving": self.panel_resize.is_some(),
             "search_visible": unsafe { IsWindowVisible(self.edit) } != 0,
@@ -2294,6 +2363,7 @@ impl App {
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
                     "toolbar_checksums": diagnostic.layout_toolbar,
                     "frame_updates": diagnostic.layout_frame_updates,
+                    "native_positions": diagnostic.layout_positions,
                 });
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
@@ -2643,6 +2713,7 @@ struct Diagnostics {
     layout_frames: Vec<f64>,
     layout_toolbar: Vec<Option<String>>,
     layout_frame_updates: Vec<serde_json::Value>,
+    layout_positions: Vec<(f64, i32)>,
 }
 
 impl Diagnostics {
@@ -2661,6 +2732,7 @@ impl Diagnostics {
             layout_frames: Vec::new(),
             layout_toolbar: Vec::new(),
             layout_frame_updates: Vec::new(),
+            layout_positions: Vec::new(),
         }
     }
 }
