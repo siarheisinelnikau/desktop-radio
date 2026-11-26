@@ -1,5 +1,7 @@
 # Desktop Radio
 
+[Download the latest Windows release](https://github.com/siarheisinelnikau/desktop-radio/releases/latest)
+
 Desktop Radio is a portable internet radio for Windows 10 and 11 (x64). Run the single `DesktopRadio-v0.2.0.exe`, then click its icon in the notification area to open the player. Playback continues when you close the panel. Right-click the icon for playback controls, Settings, and Quit.
 
 The executable contains the Rust runtime, audio decoders, station catalog, and application icon. It uses the APIs provided by Windows and runs without an installer, additional runtimes, or companion files.

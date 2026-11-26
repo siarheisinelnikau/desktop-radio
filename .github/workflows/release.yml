@@ -1,0 +1,158 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Stable version from Cargo.toml
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-radio-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify Windows x64
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-2025
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      RUST_TOOLCHAIN: 1.96.1
+      RUST_TARGET: x86_64-pc-windows-msvc
+      REQUESTED_VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the Rust toolchain
+        shell: pwsh
+        run: rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:RUST_TARGET
+      - name: Verify the requested version
+        id: version
+        shell: pwsh
+        run: |
+          $metadata = cargo "+$env:RUST_TOOLCHAIN" metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata | ConvertFrom-Json).packages |
+            Where-Object name -eq 'desktop-radio' |
+            Select-Object -ExpandProperty version
+          if ($version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' -or $version -cne $env:REQUESTED_VERSION) {
+            throw "Requested version '$env:REQUESTED_VERSION' must match the stable Cargo version '$version'."
+          }
+          if (!(Test-Path -LiteralPath "release/notes/$version.md" -PathType Leaf)) {
+            throw "Release notes for $version are missing."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Test and build
+        shell: pwsh
+        run: |
+          cargo "+$env:RUST_TOOLCHAIN" test --locked --target $env:RUST_TARGET
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo "+$env:RUST_TOOLCHAIN" build --release --locked --target $env:RUST_TARGET
+      - name: Verify and package the standalone executable
+        id: package
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $asset = "DesktopRadio-v$env:RELEASE_VERSION.exe"
+          $binary = Get-Item -LiteralPath "target/$env:RUST_TARGET/release/DesktopRadio.exe"
+          if ($binary.VersionInfo.ProductName -cne 'Desktop Radio' -or
+              $binary.VersionInfo.ProductVersion -cne $env:RELEASE_VERSION) {
+            throw "Unexpected Windows executable version or product name."
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $studio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$studio) { throw 'Visual Studio C++ tools were not found.' }
+          $msvc = Get-ChildItem -Directory -LiteralPath (Join-Path $studio 'VC/Tools/MSVC') |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          $dumpbin = Join-Path $msvc.FullName 'bin/Hostx64/x64/dumpbin.exe'
+          $headers = & $dumpbin /headers $binary.FullName
+          if ($LASTEXITCODE -ne 0 -or !($headers -match '^\s+8664 machine \(x64\)')) {
+            throw 'The executable is not an x64 PE image.'
+          }
+          $imports = & $dumpbin /dependents $binary.FullName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dlls = foreach ($line in $imports) {
+            if ($line -match '^\s+([a-zA-Z0-9_.-]+\.dll)\s*$') { $Matches[1] }
+          }
+          if (!$dlls) { throw 'The executable import list could not be read.' }
+          $windowsDlls = @(
+            'ntdll.dll', 'kernel32.dll', 'kernelbase.dll', 'combase.dll', 'oleaut32.dll',
+            'ole32.dll', 'gdiplus.dll', 'user32.dll', 'dwmapi.dll', 'comctl32.dll',
+            'shell32.dll', 'gdi32.dll', 'winhttp.dll', 'winmm.dll', 'bcryptprimitives.dll',
+            'advapi32.dll', 'bcrypt.dll', 'crypt32.dll', 'secur32.dll', 'userenv.dll',
+            'ws2_32.dll'
+          )
+          foreach ($dll in $dlls) {
+            if ($dll -notin $windowsDlls -and $dll -notmatch '^api-ms-win-(core|shcore)-') {
+              throw "Unexpected runtime dependency $dll."
+            }
+          }
+          $null = New-Item -ItemType Directory -Path dist
+          Copy-Item -LiteralPath $binary.FullName -Destination "dist/$asset"
+          $sha256 = (Get-FileHash -LiteralPath "dist/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256  $asset" | Set-Content -LiteralPath "dist/$asset.sha256" -Encoding ascii
+          "version=$env:RELEASE_VERSION" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: desktop-radio-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish stable release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact_id }}
+          path: dist
+      - name: Verify release files
+        shell: bash
+        run: |
+          cd dist
+          asset="DesktopRadio-v$VERSION.exe"
+          sha256sum --strict --check "$asset.sha256"
+          test -s "$asset"
+      - name: Publish the tested executable and its checksum
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v$VERSION"
+          asset="DesktopRadio-$tag.exe"
+          ref="$(git ls-remote --refs origin "refs/tags/$tag")"
+          if [[ -n "$ref" && "$ref" != "$GITHUB_SHA"$'\t'"refs/tags/$tag" ]]; then
+            echo "::error::The existing tag targets a different commit."
+            exit 1
+          fi
+          gh release create "$tag" "dist/$asset" "dist/$asset.sha256" \
+            --target "$GITHUB_SHA" --title "Desktop Radio $tag" \
+            --notes-file "release/notes/$VERSION.md" --latest
+          for filename in "$asset" "$asset.sha256"; do
+            digest="$(sha256sum "dist/$filename" | cut -d' ' -f1)"
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" |
+              jq -e --arg name "$filename" --arg digest "sha256:$digest" \
+                '.draft == false and .prerelease == false and any(.assets[]; .name == $name and .digest == $digest)'
+          done
+          echo "[Desktop Radio $tag](https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag)" >> "$GITHUB_STEP_SUMMARY"
