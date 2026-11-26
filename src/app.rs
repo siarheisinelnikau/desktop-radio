@@ -60,7 +60,10 @@ const INTRO_TIMER: usize = 2;
 const SAVE_TIMER: usize = 3;
 const DIAG_TIMER: usize = 4;
 const PANEL_TIMER: usize = 5;
+const SEARCH_TIMER: usize = 6;
 const PANEL_TRANSITION_MS: f32 = 245.;
+const SEARCH_TRANSITION_MS: f32 = 175.;
+const POPUP_RADIUS: f32 = 8.;
 const EDIT_ID: usize = 101;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 const APPCOMMAND_MEDIA_NEXTTRACK: u32 = 11;
@@ -417,8 +420,11 @@ struct App {
     catalog: Catalog,
     page: Page,
     player_width: f32,
-    panel_resize: Option<PanelResize>,
+    panel_resize: Option<Transition>,
     search_after_resize: bool,
+    search_open: bool,
+    search_amount: f32,
+    search_motion: Option<Transition>,
     popup_extent: (i32, i32),
     popup_limit: (i32, i32),
     popup_anchor: POINT,
@@ -527,6 +533,9 @@ impl App {
             player_width,
             panel_resize: None,
             search_after_resize: false,
+            search_open: false,
+            search_amount: 0.,
+            search_motion: None,
             popup_extent: (WIDTH, HEIGHT),
             popup_limit: (WIDTH, HEIGHT),
             popup_anchor: POINT::default(),
@@ -747,7 +756,7 @@ impl App {
                 let area = if self.page == Page::Stations {
                     MANAGE_LIST
                 } else {
-                    LIST
+                    ui::player_list_area(self.search_amount)
                 };
                 if self.can_scroll_stations()
                     && area.contains(point.x as f32 / self.scale, point.y as f32 / self.scale)
@@ -912,7 +921,9 @@ impl App {
             list: &self.list,
             top: self.top,
             query: &self.query,
-            native_search: native_search && self.station_list_ready() && self.intro.is_none(),
+            search_open: self.search_open,
+            search_amount: self.search_amount,
+            native_search: native_search && self.search_ready() && self.intro.is_none(),
             group: if self.page == Page::Stations {
                 self.manage_group
             } else {
@@ -1068,7 +1079,7 @@ impl App {
         let (max_width, height) = self.popup_limit;
         let width = self.pixel(self.popup_width()).min(max_width);
         self.popup_extent = (width, height);
-        let refresh_corners = self.dirty
+        let refresh_frame = self.dirty
             || self.surface.as_ref().is_none_or(|surface| {
                 let capacity = if self.panel_resize.is_some() {
                     max_width
@@ -1077,13 +1088,14 @@ impl App {
                 };
                 surface.width != capacity || surface.height != height
             });
-        let meter_only = self.meter_dirty && !refresh_corners;
+        let meter_only = self.meter_dirty && !refresh_frame;
         if !self.render_surface(width, height) {
             return false;
         }
-        let radius = self.pixel(8.).max(1);
+        let radius = self.pixel(POPUP_RADIUS).max(1);
+        let border = Palette::for_theme(&self.prefs.theme).popup_border();
         let surface = self.surface.as_mut().unwrap();
-        surface.set_layer_alpha(width, radius, refresh_corners);
+        surface.finish_layer(width, radius, border, refresh_frame);
         let origin = POINT {
             x: self.popup_anchor.x - width,
             y: self.popup_anchor.y - height,
@@ -1317,6 +1329,7 @@ impl App {
         }
         self.visible = false;
         self.reset_panel_resize();
+        self.finish_search(false);
         if self.intro.take().is_some() {
             if let Some(report) = &mut self.report {
                 report.intro_start = None;
@@ -1338,7 +1351,7 @@ impl App {
         unsafe {
             ShowWindow(
                 self.edit,
-                if self.visible && self.station_list_ready() && self.intro.is_none() {
+                if self.visible && self.search_ready() && self.intro.is_none() {
                     SW_SHOWNOACTIVATE
                 } else {
                     SW_HIDE
@@ -1415,6 +1428,7 @@ impl App {
         }
         self.page = page;
         self.reset_panel_resize();
+        self.finish_search(false);
         if self.intro.is_some() {
             self.end_intro();
         }
@@ -1443,7 +1457,8 @@ impl App {
     fn change_station_list(&mut self, collapsed: bool) {
         if self.prefs.station_list_collapsed == collapsed {
             if self.panel_resize.is_none() && self.search_after_resize {
-                self.focus_search();
+                self.search_after_resize = false;
+                self.set_search_open(true);
             }
             return;
         }
@@ -1457,6 +1472,7 @@ impl App {
             .retain(|hit| hit.area.x < LIST.x || hit.area.y < 60.);
         if collapsed {
             self.search_after_resize = false;
+            self.finish_search(false);
             if unsafe { GetFocus() == self.edit } {
                 unsafe { SetFocus(self.active_popup) };
             }
@@ -1467,7 +1483,7 @@ impl App {
             && (self.report.is_some() || client_animations_enabled())
             && self.pixel(self.player_width) != self.pixel(target);
         if animate && unsafe { SetTimer(self.window, PANEL_TIMER, FRAME_MS, None) } != 0 {
-            self.panel_resize = Some(PanelResize {
+            self.panel_resize = Some(Transition {
                 from: self.player_width,
                 target,
                 started: Instant::now(),
@@ -1496,7 +1512,7 @@ impl App {
             self.present_panel_resize();
             self.show_edit();
             if focus_search {
-                self.focus_search();
+                self.set_search_open(true);
             }
         } else {
             self.mark_dirty();
@@ -1504,12 +1520,81 @@ impl App {
     }
 
     fn focus_search(&mut self) {
-        self.search_after_resize = false;
         self.focus = Some(Action::Search);
         unsafe {
             SetFocus(self.edit);
             SendMessageW(self.edit, EM_SETSEL, 0, -1);
         }
+    }
+
+    fn open_search(&mut self) {
+        self.end_intro();
+        self.set_page(Page::Player);
+        if self.station_list_ready() {
+            self.set_search_open(true);
+        } else {
+            self.search_after_resize = true;
+            self.change_station_list(false);
+        }
+    }
+
+    fn search_ready(&self) -> bool {
+        self.station_list_ready() && self.search_open && self.search_motion.is_none()
+    }
+
+    fn set_search_open(&mut self, open: bool) {
+        if self.search_open == open {
+            if self.search_ready() {
+                self.focus_search();
+            }
+            return;
+        }
+        self.search_open = open;
+        self.hot = None;
+        self.focus = None;
+        self.hits
+            .retain(|hit| !matches!(hit.action, Action::Search | Action::ClearSearch));
+        if !open {
+            if unsafe { GetFocus() == self.edit } {
+                unsafe { SetFocus(self.window) };
+            }
+            self.clear_search();
+        }
+        self.top = self
+            .top
+            .min(self.list.len().saturating_sub(self.visible_station_rows()));
+        let target = if open { 1. } else { 0. };
+        if self.visible
+            && self.station_list_ready()
+            && self.search_amount != target
+            && (self.report.is_some() || client_animations_enabled())
+            && unsafe { SetTimer(self.window, SEARCH_TIMER, FRAME_MS, None) } != 0
+        {
+            self.search_motion = Some(Transition {
+                from: self.search_amount,
+                target,
+                started: Instant::now(),
+            });
+            self.show_edit();
+            self.mark_dirty();
+        } else {
+            self.finish_search(open);
+        }
+    }
+
+    fn finish_search(&mut self, focus: bool) {
+        unsafe { KillTimer(self.window, SEARCH_TIMER) };
+        self.search_motion = None;
+        self.search_amount = if self.search_open { 1. } else { 0. };
+        self.show_edit();
+        if focus && self.visible && self.search_ready() {
+            self.focus_search();
+        }
+        self.mark_dirty();
+    }
+
+    fn visible_station_rows(&self) -> usize {
+        ui::station_rows(self.page == Page::Stations, self.search_open)
     }
 
     fn relist(&mut self, reset: bool) {
@@ -1523,7 +1608,9 @@ impl App {
         if reset {
             self.top = 0;
         }
-        self.top = self.top.min(self.list.len().saturating_sub(6));
+        self.top = self
+            .top
+            .min(self.list.len().saturating_sub(self.visible_station_rows()));
     }
 
     fn reveal_current(&mut self) {
@@ -1534,8 +1621,11 @@ impl App {
             if at < self.top {
                 self.top = at;
             }
-            if at >= self.top + 6 {
-                self.top = at.saturating_sub(3).min(self.list.len().saturating_sub(6));
+            let rows = self.visible_station_rows();
+            if at >= self.top + rows {
+                self.top = at
+                    .saturating_sub(rows / 2)
+                    .min(self.list.len().saturating_sub(rows));
             }
         }
     }
@@ -1544,7 +1634,7 @@ impl App {
         let top = self
             .top
             .saturating_add_signed(delta as isize)
-            .min(self.list.len().saturating_sub(6));
+            .min(self.list.len().saturating_sub(self.visible_station_rows()));
         if self.top != top {
             self.top = top;
             self.hot = None;
@@ -1606,6 +1696,7 @@ impl App {
                 }
                 self.save_later();
             }
+            Action::ToggleSearch => self.set_search_open(!self.search_open),
             Action::Search => unsafe {
                 SetFocus(self.edit);
             },
@@ -1718,10 +1809,7 @@ impl App {
         let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
         let control = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
         if key == b'F' as u16 && control {
-            self.end_intro();
-            self.set_page(Page::Player);
-            self.search_after_resize = true;
-            self.change_station_list(false);
+            self.open_search();
             return true;
         }
         match key {
@@ -1730,9 +1818,8 @@ impl App {
                     self.dismiss_intro();
                 } else if self.page != Page::Player {
                     self.set_page(self.page.back());
-                } else if from_edit && !self.query.is_empty() {
-                    self.clear_search();
-                    self.mark_dirty();
+                } else if self.station_list_ready() && self.search_open {
+                    self.set_search_open(false);
                 } else {
                     self.hide();
                 }
@@ -1812,7 +1899,8 @@ impl App {
             VK_MEDIA_NEXT_TRACK => self.navigate(1),
             VK_MEDIA_PREV_TRACK => self.navigate(-1),
             VK_PRIOR | VK_NEXT if !from_edit && self.can_scroll_stations() => {
-                self.scroll(if key == VK_PRIOR { -6 } else { 6 })
+                let rows = self.visible_station_rows() as i32;
+                self.scroll(if key == VK_PRIOR { -rows } else { rows })
             }
             _ => return false,
         }
@@ -2115,12 +2203,23 @@ impl App {
             }
             PANEL_TIMER => {
                 if let Some(resize) = &self.panel_resize {
-                    let (width, finished) = resize.frame(Instant::now());
+                    let (width, finished) = resize.frame(Instant::now(), PANEL_TRANSITION_MS);
                     if finished {
                         self.complete_panel_resize();
                     } else if self.pixel(width) != self.pixel(self.player_width) {
                         self.player_width = width;
                         self.present_panel_resize();
+                    }
+                }
+            }
+            SEARCH_TIMER => {
+                if let Some(motion) = &self.search_motion {
+                    let (amount, finished) = motion.frame(Instant::now(), SEARCH_TRANSITION_MS);
+                    if finished {
+                        self.finish_search(self.search_open);
+                    } else {
+                        self.search_amount = amount;
+                        self.mark_dirty();
                     }
                 }
             }
@@ -2455,6 +2554,8 @@ impl App {
             "layered": unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_LAYERED } != 0,
             "search_visible": unsafe { IsWindowVisible(self.edit) } != 0,
             "search_hit": self.hits.iter().any(|hit| hit.action == Action::Search),
+            "search_amount": self.search_amount, "query": self.query,
+            "station_hits": self.hits.iter().filter(|hit| matches!(hit.action, Action::Tune(_))).count(),
             "render": self.renders, "present": self.presents,
         }));
         let interval = match phase {
@@ -2481,6 +2582,28 @@ impl App {
                 self.show(true);
                 3100
             }
+            11 => {
+                self.open_search();
+                320
+            }
+            12 => 180,
+            13 => {
+                self.query = "unistar".into();
+                unsafe { SetWindowTextW(self.edit, wide(&self.query).as_ptr()) };
+                self.relist(true);
+                self.mark_dirty();
+                100
+            }
+            14 => {
+                self.perform(Action::ToggleSearch, 0., 0.);
+                82
+            }
+            15 => 180,
+            16 => {
+                self.perform(Action::ToggleSearch, 0., 0.);
+                82
+            }
+            17 => 180,
             _ => {
                 let diagnostic = self.report.take().unwrap();
                 let result = serde_json::json!({
@@ -2526,15 +2649,15 @@ fn player_width(collapsed: bool) -> f32 {
     (if collapsed { COMPACT_WIDTH } else { WIDTH }) as f32
 }
 
-struct PanelResize {
+struct Transition {
     from: f32,
     target: f32,
     started: Instant,
 }
 
-impl PanelResize {
-    fn frame(&self, now: Instant) -> (f32, bool) {
-        let progress = now.duration_since(self.started).as_secs_f32() * 1000. / PANEL_TRANSITION_MS;
+impl Transition {
+    fn frame(&self, now: Instant, duration_ms: f32) -> (f32, bool) {
+        let progress = now.duration_since(self.started).as_secs_f32() * 1000. / duration_ms;
         if progress >= 1. {
             return (self.target, true);
         }
@@ -2905,6 +3028,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
     let mut prefs = Preferences::default();
     apply_fixture(&mut prefs);
     let screen = unicode(&arguments[1])?;
+    let search_open = screen == "search";
     prefs.station_list_collapsed = matches!(screen, "compact" | "compact-intro");
     let (page, frame) = if matches!(screen, "intro" | "intro-return" | "compact-intro") {
         let time = arguments
@@ -2925,7 +3049,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
             "Screenshot time is only available for the intro"
         );
         (
-            Page::parse(if screen == "compact" {
+            Page::parse(if search_open || screen == "compact" {
                 "player"
             } else {
                 screen
@@ -2972,7 +3096,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
     }
     meter.update(signal, false, prefs.visualization == "waveform");
     let width = player_width(prefs.station_list_collapsed);
-    let surface = Surface::new(width as i32, HEIGHT)?;
+    let mut surface = Surface::new(width as i32, HEIGHT)?;
     {
         let mut canvas = Canvas::open(surface.dc, 1.)?;
         ui::render(
@@ -2988,6 +3112,8 @@ fn capture(arguments: &[OsString]) -> Result<()> {
                 list: &list,
                 top: 0,
                 query: "",
+                search_open,
+                search_amount: if search_open { 1. } else { 0. },
                 native_search: false,
                 group: &prefs.group,
                 hot: None,
@@ -3001,5 +3127,14 @@ fn capture(arguments: &[OsString]) -> Result<()> {
             },
         );
     }
-    surface.png(Path::new(&arguments[0]))
+    let layered = prefs.station_list_collapsed;
+    if layered {
+        surface.finish_layer(
+            width as i32,
+            POPUP_RADIUS as i32,
+            Palette::for_theme(&prefs.theme).popup_border(),
+            true,
+        );
+    }
+    surface.png(Path::new(&arguments[0]), layered)
 }

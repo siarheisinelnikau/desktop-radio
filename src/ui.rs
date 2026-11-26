@@ -8,11 +8,21 @@ pub const WIDTH: i32 = 720;
 pub const COMPACT_WIDTH: i32 = 310;
 pub const HEIGHT: i32 = 570;
 pub const EDIT: Area = Area::new(347., 141., 333., 21.);
-pub const LIST: Area = Area::new(307., 184., 390., 352.);
+pub const LIST: Area = Area::new(307., 132., 390., 404.);
 pub const MANAGE_LIST: Area = Area::new(22., 195., 675., 340.);
 const VOLUME: Area = Area::new(67., 491., 153., 25.);
 const EQ_HEIGHT: f32 = 207.;
 const EQ_TOP: f32 = 196.;
+const SEARCH_SPACE: f32 = 52.;
+
+pub fn player_list_area(search: f32) -> Area {
+    let inset = SEARCH_SPACE * search;
+    Area::new(LIST.x, LIST.y + inset, LIST.w, LIST.h - inset)
+}
+
+pub fn station_rows(manage: bool, search_open: bool) -> usize {
+    if manage || search_open { 6 } else { 7 }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -60,6 +70,7 @@ pub enum Action {
     Page(Page),
     Group(&'static str),
     GroupVisible(&'static str),
+    ToggleSearch,
     Search,
     ClearSearch,
     Tune(usize),
@@ -151,6 +162,10 @@ impl Palette {
         }
         palette
     }
+
+    pub fn popup_border(self) -> Color {
+        blend(self.accent, self.outline, 24)
+    }
 }
 
 pub struct View<'a> {
@@ -164,6 +179,8 @@ pub struct View<'a> {
     pub list: &'a [usize],
     pub top: usize,
     pub query: &'a str,
+    pub search_open: bool,
+    pub search_amount: f32,
     pub native_search: bool,
     pub group: &'a str,
     pub hot: Option<Action>,
@@ -434,9 +451,53 @@ impl Draw<'_, '_> {
     }
 
     fn station_list(&mut self) {
-        self.group_tabs(A::new(307., 87., 391., 36.), false, false);
-        self.search();
-        self.rows(LIST, false);
+        self.group_tabs(A::new(307., 87., 345., 36.), false, false);
+        self.icon_button(
+            A::new(662., 87., 36., 36.),
+            Action::ToggleSearch,
+            Icon::Search,
+            self.view.search_open,
+        );
+        let amount = self.view.search_amount;
+        let list = player_list_area(amount);
+        if amount == 0. || amount == 1. {
+            if amount == 1. {
+                self.search();
+            }
+            self.rows(list, false);
+            return;
+        }
+
+        let reveal = A::new(
+            LIST.x - 1.,
+            LIST.y - 1.,
+            LIST.w + 3.,
+            SEARCH_SPACE * amount + 1.,
+        );
+        self.canvas.clipped(reveal, |canvas| {
+            Draw {
+                canvas,
+                view: self.view,
+                palette: self.palette,
+                hits: Vec::new(),
+            }
+            .search();
+        });
+        self.canvas
+            .clipped(A::new(list.x - 1., list.y, list.w + 2., list.h), |canvas| {
+                let mut rows = Draw {
+                    canvas,
+                    view: self.view,
+                    palette: self.palette,
+                    hits: Vec::new(),
+                };
+                rows.rows(list, false);
+                self.hits.extend(
+                    rows.hits
+                        .into_iter()
+                        .filter(|hit| hit.area.bottom() <= list.bottom()),
+                );
+            });
     }
 
     fn hero(&mut self) {
@@ -671,24 +732,35 @@ impl Draw<'_, '_> {
         let groups: Vec<_> = GROUPS
             .into_iter()
             .filter(|group| all || !self.view.prefs.hidden_groups.contains(*group))
+            .map(|group| (group, group_name(group, &self.view.prefs.language)))
             .collect();
         if groups.is_empty() {
             return;
         }
         self.canvas.panel(area, 11., p.panel, Some(p.outline));
-        let width = (area.w - 8.) / groups.len() as f32;
-        for (i, group) in groups.into_iter().enumerate() {
+        let weight = |title: &str| {
+            if all {
+                1.
+            } else {
+                10. + title.chars().count() as f32
+            }
+        };
+        let unit = (area.w - 8.) / groups.iter().map(|(_, title)| weight(title)).sum::<f32>();
+        let font = if (area.w - 8.) / (groups.len() as f32) < 90. {
+            12
+        } else {
+            14
+        };
+        let mut left = area.x + 4.;
+        for (group, title) in groups {
+            let width = unit * weight(title);
             let action = if visibility {
                 Action::GroupVisible(group)
             } else {
                 Action::Group(group)
             };
-            let button = A::new(
-                area.x + 4. + i as f32 * width,
-                area.y + 4.,
-                width - 2.,
-                area.h - 8.,
-            );
+            let button = A::new(left, area.y + 4., width - 2., area.h - 8.);
+            left += width;
             let active = if visibility {
                 !self.view.prefs.hidden_groups.contains(group)
             } else {
@@ -704,8 +776,8 @@ impl Draw<'_, '_> {
             self.canvas.panel(button, 8., background, None);
             self.text(
                 button,
-                group_name(group, &self.view.prefs.language),
-                if width < 90. { 12 } else { 14 },
+                title,
+                font,
                 true,
                 if active { p.accent_ink } else { p.muted },
                 Center,
@@ -717,8 +789,15 @@ impl Draw<'_, '_> {
 
     fn rows(&mut self, area: A, manage: bool) {
         let p = self.palette;
-        let visible = 6;
-        let step = (area.h + 3.) / visible as f32;
+        let visible = station_rows(manage, self.view.search_open);
+        let step = if manage {
+            (area.h + 3.) / visible as f32
+        } else {
+            let closed = (LIST.h + 3.) / station_rows(false, false) as f32;
+            let open = (LIST.h - SEARCH_SPACE + 3.) / station_rows(false, true) as f32;
+            closed + (open - closed) * self.view.search_amount
+        };
+        let drawn = ((area.h + 3.) / step - 0.001).ceil() as usize;
         let scrollable = self.view.list.len() > visible;
         for (position, &index) in self
             .view
@@ -726,7 +805,7 @@ impl Draw<'_, '_> {
             .iter()
             .enumerate()
             .skip(self.view.top)
-            .take(visible)
+            .take(drawn)
         {
             let station = &self.view.catalog.0[index];
             let current = self.view.current == Some(index);

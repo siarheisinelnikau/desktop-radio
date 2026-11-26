@@ -145,7 +145,7 @@ impl Surface {
         unsafe { BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY) != 0 }
     }
 
-    pub fn set_layer_alpha(&mut self, width: i32, radius: i32, refresh_corners: bool) {
+    pub fn finish_layer(&mut self, width: i32, radius: i32, border: Color, refresh_frame: bool) {
         let radius = radius.min(width / 2).min(self.height / 2) as usize;
         let width = width as usize;
         let height = self.height as usize;
@@ -161,19 +161,31 @@ impl Surface {
                 for pixel in &mut scanline[inset..width - inset] {
                     *pixel |= 0xff00_0000;
                 }
-                if refresh_corners && dy < radius {
+                if !refresh_frame {
+                    continue;
+                }
+                if dy == 0 {
+                    scanline[inset..width - inset].fill(border);
+                }
+                if dy >= radius {
+                    scanline[0] = border;
+                    scanline[width - 1] = border;
+                } else {
                     let dy = radius as f32 - dy as f32 - 0.5;
                     for x in 0..radius {
                         let dx = radius as f32 - x as f32 - 0.5;
-                        let coverage = (radius as f32 + 0.5 - dx.hypot(dy)).clamp(0., 1.);
-                        let alpha = (coverage * 255.).round() as u32;
+                        let edge = radius as f32 + 0.5 - dx.hypot(dy);
+                        let alpha = (edge.clamp(0., 1.) * 255.).round() as u32;
+                        let fill = ((edge - 1.).clamp(0., 1.) * 255.).round() as u32;
                         for index in [x, width - 1 - x] {
                             let rgb = scanline[index];
-                            let premultiply = |shift: u32| {
-                                ((((rgb >> shift) & 255) * alpha + 127) / 255) << shift
+                            let mix_channel = |shift: u32| {
+                                let fill_value = ((rgb >> shift) & 255) * fill;
+                                let border_value = ((border >> shift) & 255) * (alpha - fill);
+                                ((fill_value + border_value + 127) / 255) << shift
                             };
                             scanline[index] =
-                                (alpha << 24) | premultiply(16) | premultiply(8) | premultiply(0);
+                                (alpha << 24) | mix_channel(16) | mix_channel(8) | mix_channel(0);
                         }
                     }
                 }
@@ -202,23 +214,40 @@ impl Surface {
         }
     }
 
-    pub fn png(&self, path: &Path) -> Result<()> {
+    pub fn png(&self, path: &Path, layered: bool) -> Result<()> {
         unsafe {
             GdiFlush();
         }
         let source = unsafe {
             std::slice::from_raw_parts(self.pixels, (self.width * self.height * 4) as usize)
         };
-        let mut pixels = Vec::with_capacity(source.len() / 4 * 3);
+        let mut pixels = Vec::with_capacity(source.len() / 4 * if layered { 4 } else { 3 });
         for bgra in source.chunks_exact(4) {
-            pixels.extend([bgra[2], bgra[1], bgra[0]]);
+            if layered {
+                let alpha = bgra[3] as u32;
+                let straight = |channel: u8| {
+                    ((channel as u32 * 255 + alpha / 2) / alpha.max(1)).min(255) as u8
+                };
+                pixels.extend([
+                    straight(bgra[2]),
+                    straight(bgra[1]),
+                    straight(bgra[0]),
+                    bgra[3],
+                ]);
+            } else {
+                pixels.extend([bgra[2], bgra[1], bgra[0]]);
+            }
         }
         let mut encoder = png::Encoder::new(
             BufWriter::new(File::create(path)?),
             self.width as u32,
             self.height as u32,
         );
-        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_color(if layered {
+            png::ColorType::Rgba
+        } else {
+            png::ColorType::Rgb
+        });
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header()?.write_image_data(&pixels)?;
         Ok(())
