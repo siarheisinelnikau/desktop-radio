@@ -89,11 +89,12 @@ pub enum Action {
     CheckUpdate,
     InstallUpdate,
     Scroll(i32),
+    ScrollThumb,
 }
 
 impl Action {
     pub fn is_slider(self) -> bool {
-        matches!(self, Self::Volume | Self::Band(_))
+        matches!(self, Self::Volume | Self::Band(_) | Self::ScrollThumb)
     }
 
     pub fn volume(x: f32) -> u8 {
@@ -110,6 +111,32 @@ impl Action {
 pub struct Hit {
     pub area: Area,
     pub action: Action,
+}
+
+pub struct Scrollbar {
+    pub track: Area,
+    pub thumb: Area,
+    pub last: usize,
+}
+
+impl Scrollbar {
+    pub fn new(area: Area, count: usize, visible: usize, top: usize) -> Option<Self> {
+        let last = count.saturating_sub(visible);
+        if last == 0 {
+            return None;
+        }
+        let track = A::new(area.right() - 4., area.y + 3., 4., area.h - 9.);
+        let length = (track.h * visible as f32 / count as f32).max(21.);
+        let offset = (track.h - length) * top.min(last) as f32 / last as f32;
+        let thumb = A::new(track.x, track.y + offset, track.w, length);
+        Some(Self { track, thumb, last })
+    }
+
+    pub fn top_for(&self, pointer_y: f32, grab_offset: f32) -> usize {
+        let travel = self.track.h - self.thumb.h;
+        let fraction = ((pointer_y - grab_offset - self.track.y) / travel).clamp(0., 1.);
+        (fraction * self.last as f32).round() as usize
+    }
 }
 
 #[derive(Clone, Default)]
@@ -798,7 +825,7 @@ impl Draw<'_, '_> {
             closed + (open - closed) * self.view.search_amount
         };
         let drawn = ((area.h + 3.) / step - 0.001).ceil() as usize;
-        let scrollable = self.view.list.len() > visible;
+        let scrollbar = Scrollbar::new(area, self.view.list.len(), visible, self.view.top);
         for (position, &index) in self
             .view
             .list
@@ -817,7 +844,7 @@ impl Draw<'_, '_> {
             let row = A::new(
                 area.x,
                 area.y + (position - self.view.top) as f32 * step,
-                area.w - if scrollable { 11. } else { 0. },
+                area.w - if scrollbar.is_some() { 11. } else { 0. },
                 step - 6.,
             );
             let color = if current && !manage {
@@ -913,27 +940,35 @@ impl Draw<'_, '_> {
                 p.muted,
                 Center,
             );
-        } else if scrollable {
-            let track = A::new(area.right() - 4., area.y + 3., 4., area.h - 9.);
-            let length = (track.h * visible as f32 / self.view.list.len() as f32).max(21.);
-            let offset =
-                (track.h - length) * self.view.top as f32 / (self.view.list.len() - visible) as f32;
+        } else if let Some(Scrollbar { track, thumb, .. }) = scrollbar {
             self.canvas.panel(track, 2., p.outline, None);
             self.canvas.panel(
-                A::new(track.x, track.y + offset, 4., length),
+                thumb,
                 2.,
-                p.muted,
+                if self.view.hot == Some(Action::ScrollThumb)
+                    || self.view.focus == Some(Action::ScrollThumb)
+                {
+                    p.accent
+                } else {
+                    p.muted
+                },
                 None,
             );
-            let upper = A::new(track.x - 5., track.y - 2., 10., offset + length / 2.);
-            let lower = A::new(
-                upper.x,
-                upper.bottom(),
-                10.,
-                track.bottom() - upper.bottom(),
-            );
-            self.hit(Action::Scroll(-5), upper);
-            self.hit(Action::Scroll(5), lower);
+            let left = track.x - 6.;
+            let width = track.w + 10.;
+            if thumb.y > track.y {
+                self.hit(
+                    Action::Scroll(-5),
+                    A::new(left, track.y, width, thumb.y - track.y),
+                );
+            }
+            if thumb.bottom() < track.bottom() {
+                self.hit(
+                    Action::Scroll(5),
+                    A::new(left, thumb.bottom(), width, track.bottom() - thumb.bottom()),
+                );
+            }
+            self.hit(Action::ScrollThumb, A::new(left, thumb.y, width, thumb.h));
         }
     }
 

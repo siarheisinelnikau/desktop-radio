@@ -2,14 +2,14 @@
 
 use crate::{
     audio::{self, Engine, METER_SIZE, Signal, Status},
-    canvas::{Canvas, GdiPlus, Surface},
+    canvas::{Area, Canvas, GdiPlus, Surface},
     http::wide,
     intro::{Animation, END_MS, FRAME_MS, Frame},
     media::{MediaKey, MediaSession},
     model::{Catalog, GROUPS, Preferences, UnavailableAt, data_dir, label, now},
     ui::{
-        self, Action, COMPACT_WIDTH, EDIT, HEIGHT, Hit, LIST, MANAGE_LIST, Page, Palette, Toggle,
-        UpdateDisplay, View, WIDTH,
+        self, Action, COMPACT_WIDTH, EDIT, HEIGHT, Hit, LIST, MANAGE_LIST, Page, Palette,
+        Scrollbar, Toggle, UpdateDisplay, View, WIDTH,
     },
     updates::{self, Check, Release},
 };
@@ -80,6 +80,12 @@ enum Event {
     Checked(bool, Result<Check, String>),
     Progress(u8),
     Downloaded(Result<(), String>),
+}
+
+#[derive(Clone, Copy)]
+enum PointerDrag {
+    Control(Action),
+    ScrollThumb { grab_offset: f32 },
 }
 
 fn publish(sender: &Sender<Event>, window: usize, value: Event) {
@@ -438,7 +444,8 @@ struct App {
     hits: Vec<Hit>,
     hot: Option<Action>,
     focus: Option<Action>,
-    drag: Option<Action>,
+    drag: Option<PointerDrag>,
+    wheel_remainder: i32,
     scale: f32,
     dirty: bool,
     meter_dirty: bool,
@@ -550,6 +557,7 @@ impl App {
             hot: None,
             focus: None,
             drag: None,
+            wheel_remainder: 0,
             scale: 1.,
             dirty: true,
             meter_dirty: false,
@@ -685,8 +693,9 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 let (x, y) = self.logical(l);
-                if let Some(drag) = self.drag {
-                    self.perform(drag, x, y);
+                self.move_pointer_drag(x, y);
+                if matches!(self.drag, Some(PointerDrag::ScrollThumb { .. })) {
+                    return Some(0);
                 }
                 let hot = self.at(x, y);
                 if self.hot != hot {
@@ -705,7 +714,9 @@ impl App {
                 true
             }
             WM_MOUSELEAVE => {
-                if self.hot.take().is_some() {
+                if !matches!(self.drag, Some(PointerDrag::ScrollThumb { .. }))
+                    && self.hot.take().is_some()
+                {
                     self.mark_dirty();
                 }
                 true
@@ -716,33 +727,15 @@ impl App {
                     return Some(0);
                 }
                 let (x, y) = self.logical(l);
-                if let Some(action) = self.at(x, y) {
-                    self.focus = None;
-                    if action != Action::Search {
-                        unsafe {
-                            SetFocus(hwnd);
-                        }
-                    }
-                    if action.is_slider() {
-                        self.drag = Some(action);
-                        unsafe {
-                            SetCapture(hwnd);
-                        }
-                    }
-                    self.perform(action, x, y);
-                }
+                self.press_at(hwnd, x, y);
                 true
             }
-            WM_LBUTTONUP => {
-                if self.drag.take().is_some() {
-                    unsafe {
-                        ReleaseCapture();
-                    }
-                }
+            WM_LBUTTONUP | WM_CANCELMODE => {
+                self.end_pointer_drag(true);
                 true
             }
             WM_CAPTURECHANGED => {
-                self.drag = None;
+                self.end_pointer_drag(false);
                 true
             }
             WM_MOUSEWHEEL => {
@@ -753,16 +746,11 @@ impl App {
                 unsafe {
                     ScreenToClient(hwnd, &mut point);
                 }
-                let area = if self.page == Page::Stations {
-                    MANAGE_LIST
-                } else {
-                    ui::player_list_area(self.search_amount)
-                };
-                if self.can_scroll_stations()
-                    && area.contains(point.x as f32 / self.scale, point.y as f32 / self.scale)
-                {
-                    self.scroll(if ((w >> 16) as u16 as i16) > 0 { -3 } else { 3 });
-                }
+                self.scroll_wheel(
+                    point.x as f32 / self.scale,
+                    point.y as f32 / self.scale,
+                    (w >> 16) as u16 as i16 as i32,
+                );
                 true
             }
             WM_KEYDOWN | EDIT_KEY => self.key(w as u16, message == EDIT_KEY),
@@ -1047,9 +1035,7 @@ impl App {
         if previous == popup && unsafe { IsWindowVisible(popup) } != 0 {
             return;
         }
-        if self.drag.take().is_some() {
-            unsafe { ReleaseCapture() };
-        }
+        self.end_pointer_drag(true);
         self.active_popup = popup;
         let other = if popup == self.window {
             self.compact_window
@@ -1328,6 +1314,7 @@ impl App {
             return;
         }
         self.visible = false;
+        self.wheel_remainder = 0;
         self.reset_panel_resize();
         self.finish_search(false);
         if self.intro.take().is_some() {
@@ -1337,7 +1324,7 @@ impl App {
         }
         self.hot = None;
         self.focus = None;
-        self.drag = None;
+        self.end_pointer_drag(true);
         self.engine.watch(false);
         unsafe {
             KillTimer(self.window, METER_TIMER);
@@ -1422,11 +1409,60 @@ impl App {
             .map(|hit| hit.action)
     }
 
+    fn press_at(&mut self, hwnd: HWND, x: f32, y: f32) {
+        let Some(action) = self.at(x, y) else { return };
+        self.focus = None;
+        if self.report.is_none() && action != Action::Search {
+            unsafe { SetFocus(hwnd) };
+        }
+        if action == Action::ScrollThumb {
+            let Some(bar) = self.scrollbar() else { return };
+            self.drag = Some(PointerDrag::ScrollThumb {
+                grab_offset: y - bar.thumb.y,
+            });
+            self.hot = Some(Action::ScrollThumb);
+            self.mark_dirty();
+        } else {
+            if action.is_slider() {
+                self.drag = Some(PointerDrag::Control(action));
+            }
+            self.perform(action, x, y);
+        }
+        if self.report.is_none() && self.drag.is_some() {
+            unsafe { SetCapture(hwnd) };
+        }
+    }
+
+    fn move_pointer_drag(&mut self, x: f32, y: f32) {
+        match self.drag {
+            Some(PointerDrag::Control(action)) => self.perform(action, x, y),
+            Some(PointerDrag::ScrollThumb { grab_offset }) => {
+                if let Some(bar) = self.scrollbar() {
+                    self.scroll_to(bar.top_for(y, grab_offset));
+                }
+            }
+            None => (),
+        }
+    }
+
+    fn end_pointer_drag(&mut self, release: bool) {
+        let Some(drag) = self.drag.take() else { return };
+        if release && self.report.is_none() {
+            unsafe { ReleaseCapture() };
+        }
+        if matches!(drag, PointerDrag::ScrollThumb { .. }) {
+            self.hot = None;
+            self.mark_dirty();
+        }
+    }
+
     fn set_page(&mut self, page: Page) {
         if page == self.page {
             return;
         }
         self.page = page;
+        self.end_pointer_drag(true);
+        self.wheel_remainder = 0;
         self.reset_panel_resize();
         self.finish_search(false);
         if self.intro.is_some() {
@@ -1452,6 +1488,54 @@ impl App {
 
     fn can_scroll_stations(&self) -> bool {
         self.page == Page::Stations || self.station_list_ready()
+    }
+
+    fn station_list_area(&self) -> Area {
+        if self.page == Page::Stations {
+            MANAGE_LIST
+        } else {
+            ui::player_list_area(self.search_amount)
+        }
+    }
+
+    fn scrollbar(&self) -> Option<Scrollbar> {
+        if !self.can_scroll_stations() {
+            return None;
+        }
+        Scrollbar::new(
+            self.station_list_area(),
+            self.list.len(),
+            self.visible_station_rows(),
+            self.top,
+        )
+    }
+
+    fn scroll_wheel(&mut self, x: f32, y: f32, delta: i32) {
+        let list = self.station_list_area();
+        let input = Area::new(list.x, list.y, list.w + 4., list.h);
+        if !self.can_scroll_stations() || !input.contains(x, y) {
+            self.wheel_remainder = 0;
+            return;
+        }
+        let wheel = WHEEL_DELTA as i32;
+        let total = self.wheel_remainder + delta;
+        self.wheel_remainder = total % wheel;
+        let notches = total / wheel;
+        if notches != 0 {
+            self.scroll(-notches * self.wheel_scroll_rows());
+        }
+    }
+
+    fn wheel_scroll_rows(&self) -> i32 {
+        let mut lines = 3_u32;
+        unsafe {
+            SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, (&raw mut lines).cast(), 0);
+        }
+        if lines == u32::MAX {
+            self.visible_station_rows() as i32
+        } else {
+            lines.min(self.list.len() as u32) as i32
+        }
     }
 
     fn change_station_list(&mut self, collapsed: bool) {
@@ -1550,6 +1634,7 @@ impl App {
             return;
         }
         self.search_open = open;
+        self.end_pointer_drag(true);
         self.hot = None;
         self.focus = None;
         self.hits
@@ -1631,13 +1716,15 @@ impl App {
     }
 
     fn scroll(&mut self, delta: i32) {
-        let top = self
-            .top
-            .saturating_add_signed(delta as isize)
-            .min(self.list.len().saturating_sub(self.visible_station_rows()));
+        self.scroll_to(self.top.saturating_add_signed(delta as isize));
+    }
+
+    fn scroll_to(&mut self, top: usize) {
+        let top = top.min(self.list.len().saturating_sub(self.visible_station_rows()));
         if self.top != top {
             self.top = top;
-            self.hot = None;
+            self.hot = matches!(self.drag, Some(PointerDrag::ScrollThumb { .. }))
+                .then_some(Action::ScrollThumb);
             if matches!(
                 self.focus,
                 Some(
@@ -1801,6 +1888,7 @@ impl App {
             Action::CheckUpdate => self.check_update(true),
             Action::InstallUpdate => self.install_update(),
             Action::Scroll(delta) => self.scroll(delta),
+            Action::ScrollThumb => return,
         }
         self.mark_dirty();
     }
@@ -2604,6 +2692,15 @@ impl App {
                 82
             }
             17 => 180,
+            18 => {
+                self.diagnose_scroll_input();
+                self.set_page(Page::Stations);
+                160
+            }
+            19 => {
+                self.diagnose_scroll_input();
+                110
+            }
             _ => {
                 let diagnostic = self.report.take().unwrap();
                 let result = serde_json::json!({
@@ -2611,6 +2708,7 @@ impl App {
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
                     "toolbar_checksums": diagnostic.layout_toolbar,
                     "native_positions": diagnostic.layout_positions,
+                    "scroll": diagnostic.layout_scroll,
                 });
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
@@ -2624,6 +2722,52 @@ impl App {
         };
         unsafe {
             SetTimer(self.window, DIAG_TIMER, interval, None);
+        }
+    }
+
+    fn diagnose_scroll_input(&mut self) {
+        self.scroll_to(0);
+        self.render_client();
+        let bar = self.scrollbar().unwrap();
+        let (x, y) = bar.thumb.center();
+        self.press_at(self.active_popup, x, y);
+        let grabbed = matches!(self.drag, Some(PointerDrag::ScrollThumb { .. })) && self.top == 0;
+        self.move_pointer_drag(x - 150., bar.track.bottom() + 35.);
+        let last = self.top;
+        self.move_pointer_drag(x - 150., bar.track.y - 35.);
+        let first = self.top;
+        self.end_pointer_drag(true);
+        let released = self.drag.is_none();
+
+        let (_, list_y) = self.station_list_area().center();
+        let delta = WHEEL_DELTA as i32;
+        let wheel_rows = self.wheel_scroll_rows() as usize;
+        self.scroll_wheel(x, list_y, -delta / 2);
+        let partial_wheel = self.top;
+        self.scroll_wheel(x, list_y, -delta / 2);
+        let wheel_down = self.top;
+        self.scroll_wheel(3., list_y, -delta);
+        let outside_wheel = self.top;
+        self.scroll_wheel(x, list_y, delta);
+        let wheel_up = self.top;
+        self.press_at(
+            self.active_popup,
+            x,
+            (bar.thumb.bottom() + bar.track.bottom()) / 2.,
+        );
+        let page_down = self.top;
+        self.scroll_to(0);
+
+        if let Some(report) = &mut self.report {
+            report.layout_scroll.push(serde_json::json!({
+                "page": format!("{:?}", self.page),
+                "grabbed": grabbed, "released": released,
+                "last": last, "expected_last": bar.last, "first": first,
+                "partial_wheel": partial_wheel, "wheel_down": wheel_down,
+                "expected_wheel": wheel_rows.min(bar.last),
+                "outside_wheel": outside_wheel, "wheel_up": wheel_up,
+                "page_down": page_down, "expected_page": 5.min(bar.last),
+            }));
         }
     }
 }
@@ -2674,6 +2818,9 @@ unsafe extern "system" fn search_proc(
     _: usize,
     parent: usize,
 ) -> LRESULT {
+    if message == WM_MOUSEWHEEL {
+        return DefWindowProcW(window, message, w, l);
+    }
     if message == WM_KEYDOWN && matches!(w as u16, VK_ESCAPE | VK_TAB | VK_RETURN) {
         PostMessageW(parent as HWND, EDIT_KEY, w, l);
         return 0;
@@ -2962,6 +3109,7 @@ struct Diagnostics {
     layout_frames: Vec<f64>,
     layout_toolbar: Vec<Option<String>>,
     layout_positions: Vec<(f64, i32)>,
+    layout_scroll: Vec<serde_json::Value>,
 }
 
 impl Diagnostics {
@@ -2981,6 +3129,7 @@ impl Diagnostics {
             layout_frames: Vec::new(),
             layout_toolbar: Vec::new(),
             layout_positions: Vec::new(),
+            layout_scroll: Vec::new(),
         }
     }
 }
