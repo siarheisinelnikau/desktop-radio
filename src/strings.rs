@@ -1,5 +1,6 @@
 pub fn lookup(english: &str, language: &str) -> Option<&'static str> {
     let (russian, kazakh) = match english {
+        "Internet radio" => ("Интернет-радио", "Интернет-радио"),
         "10 bands" => ("10 полос", "10 жолақ"),
         "Add to favorites" => ("В избранное", "Таңдаулыларға қосу"),
         "Amber" => ("Янтарь", "Кәріптас"),

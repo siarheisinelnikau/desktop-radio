@@ -49,6 +49,11 @@ pub const fn rgb(rgb: u32) -> Color {
     rgb | 0xff000000
 }
 
+pub fn alpha(color: Color, opacity: f32) -> Color {
+    let opacity = ((color >> 24) as f32 * opacity.clamp(0., 1.)).round() as u32;
+    (color & 0xffffff) | (opacity << 24)
+}
+
 pub const fn blend(color: Color, over: Color, alpha: u32) -> Color {
     let red = ((((color >> 16) & 255) * alpha + ((over >> 16) & 255) * (255 - alpha)) / 255) << 16;
     let green = ((((color >> 8) & 255) * alpha + ((over >> 8) & 255) * (255 - alpha)) / 255) << 8;
@@ -184,6 +189,59 @@ pub enum Align {
     Right,
 }
 
+pub struct Gradient(*mut GpBrush);
+
+impl Gradient {
+    pub fn linear<const N: usize>(
+        from: (f32, f32),
+        to: (f32, f32),
+        stops: [(f32, Color); N],
+    ) -> Option<Self> {
+        let mut brush = null_mut();
+        unsafe {
+            if GdipCreateLineBrush(
+                &point(from),
+                &point(to),
+                stops[0].1,
+                stops[N - 1].1,
+                WrapModeTileFlipXY,
+                &mut brush,
+            ) != 0
+            {
+                return None;
+            }
+            let gradient = Self(brush.cast());
+            if N > 2 {
+                let colors = stops.map(|(_, color)| color);
+                let positions = stops.map(|(position, _)| position);
+                if GdipSetLinePresetBlend(brush, colors.as_ptr(), positions.as_ptr(), N as i32) != 0
+                {
+                    return None;
+                }
+            }
+            Some(gradient)
+        }
+    }
+}
+
+impl Drop for Gradient {
+    fn drop(&mut self) {
+        unsafe {
+            GdipDeleteBrush(self.0);
+        }
+    }
+}
+
+fn point((x, y): (f32, f32)) -> PointF {
+    PointF { X: x, Y: y }
+}
+
+impl Area {
+    pub fn around((x, y): (f32, f32), radius: f32) -> Self {
+        Self::new(x - radius, y - radius, radius * 2., radius * 2.)
+    }
+}
+
 impl Canvas {
     pub fn open(dc: HDC, scale: f32) -> Result<Self> {
         let mut canvas = Self {
@@ -226,6 +284,168 @@ impl Canvas {
     pub fn clear(&self, color: Color) {
         unsafe {
             GdipGraphicsClear(self.graphics, color);
+        }
+    }
+
+    pub fn transformed(
+        &mut self,
+        (x, y): (f32, f32),
+        (sx, sy): (f32, f32),
+        (px, py): (f32, f32),
+        draw: impl FnOnce(&mut Self),
+    ) {
+        let mut saved = 0;
+        unsafe {
+            if GdipSaveGraphics(self.graphics, &mut saved) != 0 {
+                return;
+            }
+            GdipTranslateWorldTransform(self.graphics, x, y, MatrixOrderPrepend);
+            GdipScaleWorldTransform(self.graphics, sx, sy, MatrixOrderPrepend);
+            GdipTranslateWorldTransform(self.graphics, -px, -py, MatrixOrderPrepend);
+        }
+        draw(self);
+        unsafe {
+            GdipRestoreGraphics(self.graphics, saved);
+        }
+    }
+
+    pub fn radial_gradient<const N: usize>(
+        &self,
+        area: Area,
+        center: (f32, f32),
+        stops: [(f32, Color); N],
+    ) -> Option<Gradient> {
+        let mut brush = null_mut();
+        unsafe {
+            GdipResetPath(self.path);
+            GdipAddPathEllipse(self.path, area.x, area.y, area.w, area.h);
+            if GdipCreatePathGradientFromPath(self.path, &mut brush) != 0 {
+                return None;
+            }
+            let gradient = Gradient(brush.cast());
+            // GDI+ orders its radial stops from the boundary towards the center.
+            let colors: [Color; N] = std::array::from_fn(|i| stops[N - 1 - i].1);
+            let positions: [f32; N] = std::array::from_fn(|i| 1. - stops[N - 1 - i].0);
+            if GdipSetPathGradientCenterPoint(brush, &point(center)) != 0
+                || GdipSetPathGradientPresetBlend(
+                    brush,
+                    colors.as_ptr(),
+                    positions.as_ptr(),
+                    N as i32,
+                ) != 0
+            {
+                return None;
+            }
+            Some(gradient)
+        }
+    }
+
+    pub fn gradient_ellipse(&self, area: Area, gradient: &Gradient) {
+        unsafe {
+            GdipFillEllipse(self.graphics, gradient.0, area.x, area.y, area.w, area.h);
+        }
+    }
+
+    pub fn gradient_polygon<const N: usize>(&self, points: [(f32, f32); N], gradient: &Gradient) {
+        let points = points.map(point);
+        unsafe {
+            GdipFillPolygon(
+                self.graphics,
+                gradient.0,
+                points.as_ptr(),
+                N as i32,
+                FillModeWinding,
+            );
+        }
+    }
+
+    pub fn gradient_panel(&self, area: Area, radius: f32, gradient: &Gradient) {
+        self.path(area, radius);
+        unsafe {
+            GdipFillPath(self.graphics, gradient.0, self.path);
+        }
+    }
+
+    pub fn outside_ellipse(&self, area: Area, opening: Area, color: Color) {
+        unsafe {
+            GdipResetPath(self.path);
+            GdipSetPathFillMode(self.path, FillModeAlternate);
+            GdipAddPathRectangle(self.path, area.x, area.y, area.w, area.h);
+            GdipAddPathEllipse(self.path, opening.x, opening.y, opening.w, opening.h);
+            GdipSetClipRect(
+                self.graphics,
+                area.x,
+                area.y,
+                area.w,
+                area.h,
+                CombineModeIntersect,
+            );
+            GdipSetSolidFillColor(self.brush, color);
+            GdipFillPath(self.graphics, self.brush.cast(), self.path);
+            GdipResetClip(self.graphics);
+            GdipSetPathFillMode(self.path, FillModeWinding);
+        }
+    }
+
+    pub fn arcs(&self, area: Area, starts: &[f32], sweep: f32, width: f32, color: Color) {
+        self.pen(color, width);
+        self.stroke_arcs(self.pen, area, starts, sweep);
+    }
+
+    pub fn gradient_arcs(
+        &self,
+        area: Area,
+        starts: &[f32],
+        sweep: f32,
+        width: f32,
+        gradient: &Gradient,
+    ) {
+        self.with_gradient_pen(gradient, width, |pen| {
+            self.stroke_arcs(pen, area, starts, sweep)
+        });
+    }
+
+    pub fn gradient_line(
+        &self,
+        (x1, y1): (f32, f32),
+        (x2, y2): (f32, f32),
+        width: f32,
+        gradient: &Gradient,
+    ) {
+        self.with_gradient_pen(gradient, width, |pen| unsafe {
+            GdipDrawLine(self.graphics, pen, x1, y1, x2, y2);
+        });
+    }
+
+    fn with_gradient_pen(&self, gradient: &Gradient, width: f32, draw: impl FnOnce(*mut GpPen)) {
+        let mut pen = null_mut();
+        unsafe {
+            if GdipCreatePen2(gradient.0, width, UnitWorld, &mut pen) != 0 {
+                return;
+            }
+            GdipSetPenStartCap(pen, LineCapRound);
+            GdipSetPenEndCap(pen, LineCapRound);
+        }
+        draw(pen);
+        unsafe {
+            GdipDeletePen(pen);
+        }
+    }
+
+    fn stroke_arcs(&self, pen: *mut GpPen, area: Area, starts: &[f32], sweep: f32) {
+        unsafe {
+            for &start in starts {
+                GdipDrawArc(
+                    self.graphics,
+                    pen,
+                    area.x,
+                    area.y,
+                    area.w,
+                    area.h,
+                    start,
+                    sweep,
+                );
+            }
         }
     }
 

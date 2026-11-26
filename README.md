@@ -25,6 +25,8 @@ The executable contains the Rust runtime, audio decoders, station catalog, and a
 | --- | --- |
 | ![Amber theme with the waveform visualization](docs/screenshots/amber.png) | ![Station ordering and visibility controls](docs/screenshots/stations.png) |
 
+![Broadcast mast, signal rings, and tuning needle in the opening animation](docs/screenshots/intro.png)
+
 ## Build
 
 Use Rust 1.96 or later with the Windows MSVC toolchain and Windows SDK.
@@ -39,3 +41,5 @@ The application saves preferences in `%LOCALAPPDATA%\DesktopRadio\settings.json`
 ## License
 
 [GNU General Public License v3.0](LICENSE). The station data comes from the upstream GPLv3 catalog. [Station catalog source](https://github.com/siarheisinelnikau/voyah-radio/blob/main/app/src/main/assets/stations.json)
+
+The opening animation is a Rust port of the GPLv3 Android implementation. [Animation source](https://github.com/siarheisinelnikau/voyah-radio/blob/main/app/src/main/java/app/voyahradio/ui/RadioIntro.java)

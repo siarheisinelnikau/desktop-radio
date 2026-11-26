@@ -4,6 +4,7 @@ use crate::{
     audio::{self, Engine, METER_SIZE, Signal, Status},
     canvas::{Canvas, GdiPlus, Surface},
     http::wide,
+    intro::{Animation, END_MS, FRAME_MS, Frame},
     media::{MediaKey, MediaSession},
     model::{Catalog, GROUPS, Preferences, UnavailableAt, data_dir, label, now},
     ui::{
@@ -77,7 +78,7 @@ pub fn run() -> Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     let action = arguments.first().and_then(|arg| arg.to_str()).unwrap_or("");
     match (action, arguments.len()) {
-        ("--capture", 3..=5) => capture(&arguments[1..]),
+        ("--capture", 3..=6) => capture(&arguments[1..]),
         ("--diagnose-audio", 3) => {
             audio::diagnose(Path::new(&arguments[1]), Path::new(&arguments[2]))
         }
@@ -135,9 +136,9 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
     APP.with(|state| *state.borrow_mut() = Some(app));
     with_app(|app| {
         if diagnostic {
-            app.show(false);
+            app.show(true);
             unsafe {
-                SetTimer(window, DIAG_TIMER, 850, None);
+                SetTimer(window, DIAG_TIMER, 3100, None);
             }
         } else {
             if app.prefs.play_on_startup {
@@ -149,7 +150,7 @@ fn run_window(report: Option<PathBuf>, update_failed: bool) -> Result<()> {
                 app.check_update(false);
             }
             if update_failed || !app.tray.registered {
-                app.show(false);
+                app.show(!update_failed);
             }
         }
     });
@@ -280,7 +281,8 @@ struct App {
     dirty: bool,
     visible: bool,
     meter: Meter,
-    intro: Option<Instant>,
+    intro: Option<Animation>,
+    prior_player: bool,
     save_failed: bool,
     release: Option<Release>,
     update: UpdateDisplay,
@@ -303,7 +305,6 @@ impl App {
         let catalog = Catalog::load();
         if diagnostic {
             apply_fixture(&mut prefs);
-            prefs.show_intro = false;
         }
         let current = prefs.station_id.as_deref().and_then(|id| catalog.get(id));
         let (sender, events) = mpsc::channel();
@@ -370,6 +371,7 @@ impl App {
             visible: false,
             meter: Meter::new(),
             intro: None,
+            prior_player: false,
             save_failed: false,
             release: None,
             update: UpdateDisplay::Blank,
@@ -417,7 +419,7 @@ impl App {
                 true
             }
             ACTIVATE => {
-                self.show(false);
+                self.show(true);
                 true
             }
             TRAY => {
@@ -494,6 +496,10 @@ impl App {
                 true
             }
             WM_LBUTTONDOWN => {
+                if self.intro.is_some() {
+                    self.dismiss_intro();
+                    return Some(0);
+                }
                 let (x, y) = self.logical(l);
                 if let Some(action) = self.at(x, y) {
                     self.focus = None;
@@ -609,7 +615,7 @@ impl App {
             list: &self.list,
             top: self.top,
             query: &self.query,
-            native_search: native_search && self.page == Page::Player,
+            native_search: native_search && self.page == Page::Player && self.intro.is_none(),
             group: if self.page == Page::Stations {
                 self.manage_group
             } else {
@@ -620,7 +626,7 @@ impl App {
             spectrum: self.meter.spectrum(),
             waveform: self.meter.waveform(),
             update: &self.update,
-            intro: self.intro.map(|start| start.elapsed().as_secs_f32() / 0.42),
+            intro: self.intro.as_ref().map(Animation::frame),
             save_failed: self.save_failed,
         }
     }
@@ -694,11 +700,18 @@ impl App {
         }
         self.place();
         self.visible = true;
-        if intro && self.page == Page::Player && self.prefs.show_intro {
-            self.intro = Some(Instant::now());
-            unsafe {
-                SetTimer(self.window, INTRO_TIMER, 24, None);
+        if self.page == Page::Player {
+            if intro
+                && self.prefs.show_intro
+                && (self.report.is_some() || client_animations_enabled())
+                && unsafe { SetTimer(self.window, INTRO_TIMER, FRAME_MS, None) } != 0
+            {
+                self.intro = Some(Animation::new(Instant::now(), self.prior_player));
+                if let Some(report) = &mut self.report {
+                    report.intro_start = Some((cpu_milliseconds(), self.renders));
+                }
             }
+            self.prior_player = true;
         }
         unsafe {
             ShowWindow(
@@ -728,7 +741,12 @@ impl App {
             return;
         }
         self.visible = false;
-        self.intro = None;
+        if self.intro.take().is_some() {
+            self.prior_player = false;
+            if let Some(report) = &mut self.report {
+                report.intro_start = None;
+            }
+        }
         self.hot = None;
         self.focus = None;
         self.drag = None;
@@ -820,6 +838,12 @@ impl App {
             return;
         }
         self.page = page;
+        if self.intro.is_some() {
+            self.end_intro();
+        }
+        if self.visible && page == Page::Player {
+            self.prior_player = true;
+        }
         self.hot = None;
         self.focus = None;
         self.top = 0;
@@ -892,7 +916,6 @@ impl App {
         match action {
             Action::Close => self.hide(),
             Action::Page(page) => self.set_page(page),
-            Action::DismissIntro => self.end_intro(),
             Action::Group(group) => {
                 if self.page == Page::Stations {
                     self.manage_group = group;
@@ -1029,7 +1052,7 @@ impl App {
         match key {
             VK_ESCAPE => {
                 if self.intro.is_some() {
-                    self.end_intro();
+                    self.dismiss_intro();
                 } else if self.page != Page::Player {
                     self.set_page(self.page.back());
                 } else if from_edit && !self.query.is_empty() {
@@ -1042,6 +1065,7 @@ impl App {
             VK_TAB => {
                 if self.intro.is_some() {
                     self.end_intro();
+                    return true;
                 }
                 if self.hits.is_empty() {
                     return true;
@@ -1080,7 +1104,7 @@ impl App {
             }
             VK_RETURN | VK_SPACE if !from_edit => {
                 if self.intro.is_some() {
-                    self.end_intro();
+                    self.dismiss_intro();
                 } else if let Some(action) = self.focus.filter(|action| !action.is_slider()) {
                     self.perform(action, 0., 0.);
                 } else if key == VK_SPACE && self.focus.is_none() {
@@ -1375,9 +1399,11 @@ impl App {
                 }
             }
             INTRO_TIMER => {
-                if self
-                    .intro
-                    .is_none_or(|start| start.elapsed() > Duration::from_millis(420))
+                if !self.visible
+                    || self
+                        .intro
+                        .as_mut()
+                        .is_none_or(|intro| intro.advance(Instant::now()))
                 {
                     self.end_intro();
                 } else {
@@ -1390,12 +1416,26 @@ impl App {
         }
     }
 
-    fn end_intro(&mut self) {
-        if self.intro.take().is_none() {
-            return;
+    fn dismiss_intro(&mut self) {
+        if let Some(intro) = &mut self.intro {
+            intro.dismiss(Instant::now());
         }
+    }
+
+    fn end_intro(&mut self) {
         unsafe {
             KillTimer(self.window, INTRO_TIMER);
+        }
+        let Some(intro) = self.intro.take() else {
+            return;
+        };
+        if let Some(report) = &mut self.report {
+            if let Some((cpu, renders)) = report.intro_start.take() {
+                report.intros.push(serde_json::json!({
+                    "wall_ms": intro.elapsed().as_millis(), "cpu_ms": cpu_milliseconds() - cpu,
+                    "render": self.renders - renders,
+                }));
+            }
         }
         self.show_edit();
         self.meter_schedule();
@@ -1491,7 +1531,7 @@ impl App {
                 self.receive();
             }
             match action {
-                1 => self.show(false),
+                1 => self.show(true),
                 2 => self.toggle(),
                 3 => self.navigate(-1),
                 4 => self.navigate(1),
@@ -1525,12 +1565,16 @@ impl App {
             "visible end",
             "hidden start",
             "hidden end",
+            "dismiss requested",
             "reopened",
+            "hiding during intro",
+            "hidden after interruption",
+            "hidden settled",
         ][phase];
         diagnostic.samples.push(serde_json::json!({
             "state": state,
             "ms": diagnostic.start.elapsed().as_millis(), "cpu_ms": cpu_milliseconds(),
-            "render": self.renders, "present": self.presents, "visible": visible,
+            "render": self.renders, "present": self.presents, "visible": visible, "intro_active": self.intro.is_some(),
         }));
         diagnostic.phase += 1;
         match phase {
@@ -1549,15 +1593,37 @@ impl App {
             3 => {
                 self.tray_event(NIN_SELECT);
                 unsafe {
-                    SetTimer(self.window, DIAG_TIMER, 900, None);
+                    SetTimer(self.window, DIAG_TIMER, 510, None);
                 }
             }
+            4 => {
+                self.dismiss_intro();
+                unsafe {
+                    SetTimer(self.window, DIAG_TIMER, 600, None);
+                }
+            }
+            5 => {
+                self.tray_event(NIN_SELECT);
+                self.tray_event(NIN_SELECT);
+                unsafe {
+                    SetTimer(self.window, DIAG_TIMER, 200, None);
+                }
+            }
+            6 => {
+                self.tray_event(NIN_SELECT);
+                unsafe {
+                    SetTimer(self.window, DIAG_TIMER, 400, None);
+                }
+            }
+            7 => unsafe {
+                SetTimer(self.window, DIAG_TIMER, 750, None);
+            },
             _ => {
                 let diagnostic = self.report.take().unwrap();
                 let result = serde_json::json!({"pid": std::process::id(), "backend": "GDI+ into memory DIB; Win32 BitBlt",
                     "native_tray_registered": self.tray.registered, "media_session_attached": self.media.is_some(),
                     "native_icon_loaded": !self.tray.icon.is_null(), "tray_icon_rect": self.tray.rect().is_some(),
-                    "samples": diagnostic.samples});
+                    "samples": diagnostic.samples, "intros": diagnostic.intros});
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
                         .is_ok();
@@ -1816,6 +1882,8 @@ struct Diagnostics {
     start: Instant,
     phase: usize,
     samples: Vec<serde_json::Value>,
+    intro_start: Option<(f64, u64)>,
+    intros: Vec<serde_json::Value>,
 }
 
 impl Diagnostics {
@@ -1825,8 +1893,18 @@ impl Diagnostics {
             start: Instant::now(),
             phase: 0,
             samples: Vec::new(),
+            intro_start: None,
+            intros: Vec::new(),
         }
     }
+}
+
+fn client_animations_enabled() -> bool {
+    let mut enabled = 1;
+    unsafe {
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, (&raw mut enabled).cast(), 0);
+    }
+    enabled != 0
 }
 
 fn cpu_milliseconds() -> f64 {
@@ -1863,7 +1941,33 @@ fn capture(arguments: &[OsString]) -> Result<()> {
     let _gdi = GdiPlus::start()?;
     let mut prefs = Preferences::default();
     apply_fixture(&mut prefs);
-    let page = Page::parse(unicode(&arguments[1])?).context("Unknown screenshot view")?;
+    let screen = unicode(&arguments[1])?;
+    let (page, frame) = if matches!(screen, "intro" | "intro-return") {
+        let time = arguments
+            .get(4)
+            .map(unicode)
+            .transpose()?
+            .map(str::parse)
+            .transpose()?
+            .unwrap_or(950.);
+        ensure!(
+            (0. ..=END_MS).contains(&time),
+            "Screenshot time is outside the intro"
+        );
+        (
+            Page::Player,
+            Some(Frame::at(time, screen == "intro-return")),
+        )
+    } else {
+        ensure!(
+            arguments.len() < 5,
+            "Screenshot time is only available for the intro"
+        );
+        (
+            Page::parse(screen).context("Unknown screenshot view")?,
+            None,
+        )
+    };
     if let Some(theme) = arguments.get(2) {
         let theme = unicode(theme)?;
         ensure!(
@@ -1922,7 +2026,7 @@ fn capture(arguments: &[OsString]) -> Result<()> {
                 spectrum: meter.spectrum(),
                 waveform: meter.waveform(),
                 update: &UpdateDisplay::Blank,
-                intro: None,
+                intro: frame,
                 save_failed: false,
             },
         );

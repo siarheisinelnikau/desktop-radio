@@ -75,7 +75,6 @@ pub enum Action {
     CheckUpdate,
     InstallUpdate,
     Scroll(i32),
-    DismissIntro,
 }
 
 impl Action {
@@ -167,7 +166,7 @@ pub struct View<'a> {
     pub spectrum: &'a [f32],
     pub waveform: &'a [f32],
     pub update: &'a UpdateDisplay,
-    pub intro: Option<f32>,
+    pub intro: Option<crate::intro::Frame>,
     pub save_failed: bool,
 }
 
@@ -175,17 +174,29 @@ type A = Area;
 use Align::{Center, Left, Right};
 
 pub fn render(canvas: &mut Canvas, view: &View<'_>) -> Vec<Hit> {
+    let palette = Palette::for_theme(&view.prefs.theme);
+    if let Some(frame) = view.intro {
+        let scene = crate::intro::Scene::new(frame);
+        if let Some((pivot, scale)) = scene.content() {
+            canvas.clear(palette.window);
+            canvas.transformed(pivot, (scale, scale), pivot, |canvas| {
+                draw_page(canvas, view, palette);
+            });
+        }
+        scene.draw(canvas, palette, &view.prefs.language);
+        return Vec::new();
+    }
+    canvas.clear(palette.window);
+    draw_page(canvas, view, palette)
+}
+
+fn draw_page(canvas: &mut Canvas, view: &View<'_>, palette: Palette) -> Vec<Hit> {
     let mut surface = Draw {
         canvas,
         view,
-        palette: Palette::for_theme(&view.prefs.theme),
+        palette,
         hits: Vec::new(),
     };
-    surface.canvas.clear(surface.palette.window);
-    if let Some(intro) = surface.view.intro {
-        surface.intro(intro);
-        return surface.hits;
-    }
     surface.header();
     match surface.view.page {
         Page::Player => surface.player(),
@@ -324,33 +335,6 @@ impl Draw<'_, '_> {
             self.canvas
                 .line((x, y - h * 0.5), (x, y + h * 0.5), p.accent_ink, 2.4);
         }
-    }
-
-    fn intro(&mut self, elapsed: f32) {
-        let p = self.palette;
-        let area = A::new(166., 127., 388., 304.);
-        self.canvas
-            .gradient(area, 23., p.hero_top, p.panel, p.outline);
-        self.logo(A::new(333., 200., 54., 54.));
-        self.text(
-            A::new(180., 276., 360., 42.),
-            "Desktop Radio",
-            29,
-            true,
-            p.text,
-            Center,
-        );
-        self.canvas.line((304., 344.), (416., 344.), p.outline, 3.);
-        self.canvas.line(
-            (304., 344.),
-            (304. + elapsed.clamp(0., 1.) * 112., 344.),
-            p.accent,
-            3.,
-        );
-        self.hit(
-            Action::DismissIntro,
-            A::new(0., 0., WIDTH as f32, HEIGHT as f32),
-        );
     }
 
     fn player(&mut self) {

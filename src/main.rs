@@ -5,6 +5,7 @@ mod audio;
 mod canvas;
 mod hls;
 mod http;
+mod intro;
 mod media;
 mod model;
 mod strings;
