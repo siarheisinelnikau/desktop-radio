@@ -2,9 +2,18 @@
 
 use anyhow::{Result, bail, ensure};
 use std::{
-    collections::HashMap, fs::File, io::BufWriter, path::Path, ptr::null_mut, result::Result::Ok,
+    collections::HashMap,
+    fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::BufWriter,
+    path::Path,
+    ptr::null_mut,
+    result::Result::Ok,
 };
-use windows_sys::Win32::Graphics::{Gdi::*, GdiPlus::*};
+use windows_sys::Win32::{
+    Foundation::RECT,
+    Graphics::{Gdi::*, GdiPlus::*},
+};
 
 pub type Color = u32;
 
@@ -136,16 +145,26 @@ impl Surface {
         unsafe { BitBlt(dc, 0, 0, self.width, self.height, self.dc, 0, 0, SRCCOPY) != 0 }
     }
 
-    pub fn matches_strip(&self, dc: HDC, width: i32, top: i32, bottom: i32) -> bool {
-        if top < 0 || bottom > self.height || width > self.width {
-            return false;
+    pub fn matching_client_pixels(&self, dc: HDC, area: RECT) -> Option<String> {
+        if area.left < 0 || area.top < 0 || area.right > self.width || area.bottom > self.height {
+            return None;
         }
-        let Ok(strip) = Self::new(width, bottom - top) else {
-            return false;
-        };
+        let width = area.right - area.left;
+        let strip = Self::new(width, area.bottom - area.top).ok()?;
         unsafe {
-            if BitBlt(strip.dc, 0, 0, width, strip.height, dc, 0, top, SRCCOPY) == 0 {
-                return false;
+            if BitBlt(
+                strip.dc,
+                0,
+                0,
+                width,
+                strip.height,
+                dc,
+                area.left,
+                area.top,
+                SRCCOPY,
+            ) == 0
+            {
+                return None;
             }
             GdiFlush();
             let seen = std::slice::from_raw_parts(
@@ -156,15 +175,20 @@ impl Surface {
                 self.pixels.cast::<u32>(),
                 (self.width * self.height) as usize,
             );
-            seen.chunks_exact(width as usize)
-                .enumerate()
-                .all(|(row, actual)| {
-                    let offset = (top as usize + row) * self.width as usize;
-                    expected[offset..offset + width as usize]
-                        .iter()
-                        .zip(actual)
-                        .all(|(expected, actual)| (expected ^ actual) & 0x00ff_ffff == 0)
-                })
+            let mut checksum = DefaultHasher::new();
+            for (row, pixels) in seen.chunks_exact(width as usize).enumerate() {
+                let offset = (area.top as usize + row) * self.width as usize + area.left as usize;
+                for (&expected, &actual) in
+                    expected[offset..offset + width as usize].iter().zip(pixels)
+                {
+                    let rgb = actual & 0x00ff_ffff;
+                    if expected & 0x00ff_ffff != rgb {
+                        return None;
+                    }
+                    rgb.hash(&mut checksum);
+                }
+            }
+            Some(format!("{:016x}", checksum.finish()))
         }
     }
 
@@ -314,6 +338,14 @@ impl Canvas {
     pub fn clear(&self, color: Color) {
         unsafe {
             GdipGraphicsClear(self.graphics, color);
+        }
+    }
+
+    pub fn translate_x(&mut self, x: f32) {
+        if x != 0. {
+            unsafe {
+                GdipTranslateWorldTransform(self.graphics, x, 0., MatrixOrderPrepend);
+            }
         }
     }
 

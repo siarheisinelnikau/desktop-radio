@@ -379,7 +379,7 @@ struct App {
     player_width: f32,
     panel_resize: Option<PanelResize>,
     search_after_resize: bool,
-    work_area: RECT,
+    popup_extent: (i32, i32),
     manage_group: &'static str,
     list: Vec<usize>,
     top: usize,
@@ -481,7 +481,7 @@ impl App {
             player_width,
             panel_resize: None,
             search_after_resize: false,
-            work_area: RECT::default(),
+            popup_extent: (WIDTH, HEIGHT),
             manage_group: GROUPS[0],
             list: Vec::new(),
             top: 0,
@@ -672,7 +672,10 @@ impl App {
                     LIST
                 };
                 if self.can_scroll_stations()
-                    && area.contains(point.x as f32 / self.scale, point.y as f32 / self.scale)
+                    && area.contains(
+                        (point.x - self.popup_left()) as f32 / self.scale,
+                        point.y as f32 / self.scale,
+                    )
                 {
                     self.scroll(if ((w >> 16) as u16 as i16) > 0 { -3 } else { 3 });
                 }
@@ -738,17 +741,12 @@ impl App {
         if width <= 0 || height <= 0 {
             return false;
         }
-        let capacity = if self.panel_resize.is_some() {
-            width.max(self.pixel(WIDTH as f32))
-        } else {
-            width
-        };
         if self
             .surface
             .as_ref()
-            .is_none_or(|surface| surface.width != capacity || surface.height != height)
+            .is_none_or(|surface| surface.width != width || surface.height != height)
         {
-            self.surface = Surface::new(capacity, height).ok();
+            self.surface = Surface::new(width, height).ok();
             self.dirty = true;
         }
         let Some(surface) = &self.surface else {
@@ -758,6 +756,7 @@ impl App {
             let Ok(mut canvas) = Canvas::open(surface.dc, self.scale) else {
                 return false;
             };
+            canvas.translate_x(self.popup_left() as f32 / self.scale);
             if self.dirty {
                 self.hits = ui::render(&mut canvas, &self.view(true));
             } else {
@@ -809,9 +808,11 @@ impl App {
             GdiFlush();
             let client_covered = self.report.is_some().then(|| {
                 let mut area = RECT::default();
+                let left = self.popup_left();
                 GetClientRect(self.window, &mut area) != 0
-                    && GetPixel(dc, area.right / 4, area.bottom / 4) == background
-                    && GetPixel(dc, area.right * 3 / 4, area.bottom / 2) == background
+                    && GetPixel(dc, left + (area.right - left) / 4, area.bottom / 4) == background
+                    && GetPixel(dc, left + (area.right - left) * 3 / 4, area.bottom / 2)
+                        == background
             });
             ReleaseDC(self.window, dc);
             if presented {
@@ -824,7 +825,7 @@ impl App {
     fn view(&self, native_search: bool) -> View<'_> {
         View {
             page: self.page,
-            width: self.popup_width(),
+            width: (self.popup_extent.0 - self.popup_left()) as f32 / self.scale,
             station_list_ready: self.station_list_ready(),
             prefs: &self.prefs,
             catalog: &self.catalog,
@@ -892,8 +893,22 @@ impl App {
                 self.update_edit();
                 self.surface = None;
             }
-            self.work_area = work;
-            self.resize_popup();
+            let width = self.pixel(WIDTH as f32).min(width);
+            let height = self.pixel(HEIGHT as f32).min(height);
+            let margin = self.pixel(10.);
+            if SetWindowPos(
+                self.window,
+                HWND_TOPMOST,
+                work.right - width - margin,
+                work.bottom - height - margin,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            ) != 0
+            {
+                self.popup_extent = (width, height);
+                self.apply_popup_region();
+            }
         }
     }
 
@@ -905,61 +920,61 @@ impl App {
         }
     }
 
-    fn popup_size(&self) -> (i32, i32) {
-        (
-            self.pixel(self.popup_width())
-                .min(self.work_area.right - self.work_area.left),
-            self.pixel(HEIGHT as f32)
-                .min(self.work_area.bottom - self.work_area.top),
-        )
+    fn popup_left(&self) -> i32 {
+        (self.popup_extent.0 - self.pixel(self.popup_width())).max(0)
     }
 
-    fn resize_popup(&self) -> bool {
-        let work = self.work_area;
-        let (width, height) = self.popup_size();
-        if width <= 0 || height <= 0 {
-            return false;
-        }
-        let margin = self.pixel(10.);
+    fn apply_popup_region(&self) -> bool {
+        let (width, height) = self.popup_extent;
+        let left = self.popup_left();
+        let redraw = i32::from(self.visible);
         unsafe {
-            SetWindowPos(
-                self.window,
-                HWND_TOPMOST,
-                work.right - width - margin,
-                work.bottom - height - margin,
-                width,
-                height,
-                SWP_NOACTIVATE | SWP_NOCOPYBITS,
-            ) != 0
+            if left == 0 {
+                return SetWindowRgn(self.window, null_mut(), redraw) != 0;
+            }
+            let diameter = self.pixel(16.).max(2);
+            let region = CreateRoundRectRgn(left, 0, width + 1, height + 1, diameter, diameter);
+            if region.is_null() {
+                return false;
+            }
+            if SetWindowRgn(self.window, region, redraw) != 0 {
+                return true;
+            }
+            DeleteObject(region);
+            false
         }
     }
 
     fn present_panel_resize(&mut self) {
-        // Draw the new toolbar before Windows changes the window bounds. Commit it
-        // immediately after the resize, before returning to the message queue.
+        // Keep the native window and backing bitmap at their full size so DWM
+        // never has to stretch the toolbar while changing the visible width.
         self.dirty = true;
-        let (width, height) = self.popup_size();
+        let (width, height) = self.popup_extent;
         let prepared = self.render_surface(width, height);
-        if self.resize_popup() && prepared {
+        if self.apply_popup_region() && prepared {
             unsafe {
                 let dc = GetDC(self.window);
                 if !dc.is_null() {
                     let surface = self.surface.as_ref().unwrap();
                     let presented = surface.blit(dc);
                     GdiFlush();
-                    let toolbar_top = self.pixel(14.);
-                    let toolbar_bottom = self.pixel(61.);
+                    let toolbar = RECT {
+                        left: width - self.pixel(212.),
+                        right: width - self.pixel(18.),
+                        top: self.pixel(14.),
+                        bottom: self.pixel(61.),
+                    };
                     if let Some(report) =
                         self.report.as_mut().filter(|report| report.measure_layout)
                     {
                         report
                             .layout_frames
                             .push(report.start.elapsed().as_secs_f64() * 1000.);
-                        if !presented
-                            || !surface.matches_strip(dc, width, toolbar_top, toolbar_bottom)
-                        {
-                            report.layout_toolbar_mismatches += 1;
-                        }
+                        report.layout_toolbar.push(
+                            presented
+                                .then(|| surface.matching_client_pixels(dc, toolbar))
+                                .flatten(),
+                        );
                     }
                     ReleaseDC(self.window, dc);
                     if presented {
@@ -1142,7 +1157,7 @@ impl App {
 
     fn logical(&self, value: LPARAM) -> (f32, f32) {
         (
-            (value as u16 as i16) as f32 / self.scale,
+            ((value as u16 as i16) as i32 - self.popup_left()) as f32 / self.scale,
             ((value >> 16) as u16 as i16) as f32 / self.scale,
         )
     }
@@ -1162,7 +1177,7 @@ impl App {
         self.page = page;
         self.reset_panel_resize();
         if self.visible {
-            self.resize_popup();
+            self.apply_popup_region();
         }
         if self.intro.is_some() {
             self.end_intro();
@@ -1835,10 +1850,11 @@ impl App {
                     self.meter_dirty = true;
                     let area = ui::METER_REDRAW;
                     let scale = self.scale;
+                    let left = self.popup_left();
                     let bounds = RECT {
-                        left: (area.x * scale).floor() as i32,
+                        left: left + (area.x * scale).floor() as i32,
                         top: (area.y * scale).floor() as i32,
-                        right: (area.right() * scale).ceil() as i32,
+                        right: left + (area.right() * scale).ceil() as i32,
                         bottom: (area.bottom() * scale).ceil() as i32,
                     };
                     unsafe {
@@ -2168,14 +2184,22 @@ impl App {
         let mut rect = RECT::default();
         let native_width = (unsafe { GetWindowRect(self.window, &mut rect) } != 0)
             .then_some(rect.right - rect.left);
-        let expected_width = self.pixel(self.popup_width());
+        let mut region = RECT::default();
+        let has_region = unsafe { GetWindowRgnBox(self.window, &mut region) } != 0;
+        let width = if has_region {
+            Some(region.right - region.left)
+        } else {
+            native_width
+        };
+        let expected_width = self.popup_extent.0 - self.popup_left();
         let diagnostic = self.report.as_mut().unwrap();
         let phase = diagnostic.phase;
         diagnostic.phase += 1;
         diagnostic.samples.push(serde_json::json!({
             "ms": diagnostic.start.elapsed().as_secs_f64() * 1000.,
             "cpu_ms": cpu_milliseconds(), "expected_width": expected_width,
-            "width": native_width, "right": rect.right, "page": format!("{:?}", self.page),
+            "width": width, "native_width": native_width, "right": rect.right,
+            "page": format!("{:?}", self.page),
             "visible": self.visible, "moving": self.panel_resize.is_some(),
             "search_visible": unsafe { IsWindowVisible(self.edit) } != 0,
             "search_hit": self.hits.iter().any(|hit| hit.action == Action::Search),
@@ -2210,7 +2234,7 @@ impl App {
                 let result = serde_json::json!({
                     "samples": diagnostic.samples, "present_ms": diagnostic.layout_frames,
                     "opening_frames": diagnostic.opening_frames, "intros": diagnostic.intros,
-                    "toolbar_mismatches": diagnostic.layout_toolbar_mismatches,
+                    "toolbar_checksums": diagnostic.layout_toolbar,
                 });
                 let saved =
                     std::fs::write(diagnostic.path, serde_json::to_vec_pretty(&result).unwrap())
@@ -2558,7 +2582,7 @@ struct Diagnostics {
     meter_presents: Vec<f64>,
     measure_layout: bool,
     layout_frames: Vec<f64>,
-    layout_toolbar_mismatches: usize,
+    layout_toolbar: Vec<Option<String>>,
 }
 
 impl Diagnostics {
@@ -2575,7 +2599,7 @@ impl Diagnostics {
             meter_presents: Vec::new(),
             measure_layout: false,
             layout_frames: Vec::new(),
-            layout_toolbar_mismatches: 0,
+            layout_toolbar: Vec::new(),
         }
     }
 }
